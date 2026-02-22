@@ -271,8 +271,9 @@ body{margin:0;padding:0;background:linear-gradient(180deg,#eef4f7,#e6efee);font-
 .card{background:linear-gradient(180deg,#fff,#fbfdff);border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:0 10px 24px rgba(10,31,44,.07)}
 .card h2{margin:0 0 10px;font-size:1.02rem}
 label{display:block;font-size:.82rem;color:var(--muted);font-weight:700;margin:10px 0 4px;text-transform:uppercase;letter-spacing:.03em}
-input,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:12px;font-size:15px;background:#fff}
-input:focus,select:focus{outline:none;border-color:#8bc2d3;box-shadow:0 0 0 4px rgba(22,138,173,.12)}
+input{width:100%;padding:10px;border:1px solid var(--line);border-radius:12px;font-size:15px;background:#fff}
+select.form-select{font-size:15px;border-radius:12px;border-color:var(--line);padding-top:.55rem;padding-bottom:.55rem}
+input:focus,select.form-select:focus{outline:none;border-color:#8bc2d3;box-shadow:0 0 0 4px rgba(22,138,173,.12)}
 button{margin-top:10px;background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border:0;padding:10px 14px;border-radius:12px;font-weight:700;cursor:pointer;box-shadow:0 8px 20px rgba(17,75,95,.15)}
 button.secondary{background:#fff;color:#114b5f;border:1px solid var(--line);box-shadow:none}
 button.warn{background:#8a2d12}
@@ -309,7 +310,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <span class="pill" id="wifiStatus">Wi-Fi: --</span>
         <span class="pill" id="apStatus">Setup Hotspot: --</span>
       </div>
-      <form id="setupForm">
+      <form id="setupForm" autocomplete="off">
         <label>Unit Name</label>
         <input name="unit_name" placeholder="AV Room Coil" required>
 
@@ -320,7 +321,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
           <div>
             <label>Parent Zone</label>
-            <select name="parent_zone">
+            <select class="form-select" name="parent_zone">
               <option>Zone 1</option>
               <option>Zone 2</option>
               <option>Zone 3</option>
@@ -332,11 +333,11 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <div class="row">
           <div>
             <label>Feed Probe</label>
-            <select name="feed_sensor_id" id="feedSel"></select>
+            <select class="form-select" name="feed_sensor_id" id="feedSel"></select>
           </div>
           <div>
             <label>Return Probe</label>
-            <select name="return_sensor_id" id="returnSel"></select>
+            <select class="form-select" name="return_sensor_id" id="returnSel"></select>
           </div>
         </div>
         <div>
@@ -362,7 +363,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
           <div>
             <label>Low Temp Alerts</label>
-            <select name="low_temp_enabled">
+            <select class="form-select" name="low_temp_enabled">
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
             </select>
@@ -378,17 +379,17 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
               <button type="button" class="segbtn" id="wifiModeManualBtn">Type Manually</button>
             </div>
             <div id="wifiSelectWrap">
-              <select name="wifi_ssid" id="wifiSsidSel"></select>
+              <select class="form-select" name="wifi_ssid" id="wifiSsidSel"></select>
               <div style="margin-top:6px"><button type="button" class="secondary" id="scanWifiBtn">Scan Wi-Fi Networks</button></div>
             </div>
             <div id="wifiManualWrap" class="hidden">
-              <label style="margin-top:8px">Wi-Fi SSID (Manual)</label>
+              <label style="margin-top:8px">Wi-Fi Name (SSID)</label>
               <input name="wifi_ssid_manual" placeholder="Type Wi-Fi name if scan is unavailable">
             </div>
           </div>
           <div>
             <label>Wi-Fi Password</label>
-            <input name="wifi_password" type="password" placeholder="Wi-Fi password">
+            <input name="wifi_key" type="text" inputmode="text" placeholder="Enter Wi-Fi password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" data-lpignore="true" readonly onfocus="this.removeAttribute('readonly');">
           </div>
         </div>
 
@@ -547,7 +548,7 @@ async function refreshAll(){
   fillWifiSelect(document.getElementById('wifiSsidSel'), [], (s.config.wifi && s.config.wifi.ssid) || '');
   f.wifi_ssid_manual.value = (s.config.wifi && s.config.wifi.ssid) || '';
   setWifiMode((s.config.wifi && s.config.wifi.ssid) ? 'manual' : 'select');
-  f.wifi_password.value = '';
+  f.wifi_key.value = '';
   f.hub_url.value = (s.config.hub && s.config.hub.hub_url) || '';
   f.account_label.value = (s.config.hub && s.config.hub.account_label) || '';
   f.enroll_token.value = (s.config.hub && s.config.hub.enroll_token) || '';
@@ -572,7 +573,7 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
     return_sensor_id: f.return_sensor_id.value,
     call_gpio: Number(f.call_gpio.value || 17),
     alerts: { low_temp_threshold_f: Number(f.low_temp_threshold_f.value || 35), low_temp_enabled: (f.low_temp_enabled.value === 'true') },
-    wifi: { ssid: (f.wifi_ssid_manual.value.trim() || f.wifi_ssid.value.trim()), password: f.wifi_password.value },
+    wifi: { ssid: (f.wifi_ssid_manual.value.trim() || f.wifi_ssid.value.trim()), password: f.wifi_key.value },
     hub: {
       hub_url: f.hub_url.value.trim(),
       account_label: f.account_label.value.trim(),
