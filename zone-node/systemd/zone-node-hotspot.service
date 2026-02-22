@@ -1,0 +1,12 @@
+[Unit]
+Description=Zone Node Setup Hotspot (onboarding)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zone-node-hotspot-onboot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

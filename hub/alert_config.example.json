@@ -1,0 +1,21 @@
+{
+  "cooldown_minutes": 30,
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "username": "you@example.com",
+    "password": "app_password_here",
+    "from": "you@example.com",
+    "to": ["you@example.com"],
+    "use_tls": true
+  },
+  "sms": {
+    "enabled": false,
+    "provider": "twilio",
+    "account_sid": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "auth_token": "your_twilio_auth_token",
+    "from": "+15551234567",
+    "to": ["+15557654321"]
+  }
+}

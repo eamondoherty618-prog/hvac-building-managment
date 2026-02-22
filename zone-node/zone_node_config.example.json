@@ -1,0 +1,26 @@
+{
+  "configured": false,
+  "unit_name": "New Zone Node",
+  "zone_id": "",
+  "parent_zone": "Zone 1",
+  "feed_sensor_id": "28-0417701d59ff",
+  "return_sensor_id": "28-041770d515ff",
+  "call_gpio": 17,
+  "call_active_mode": "dry_contact_to_gnd",
+  "port": 8090,
+  "hub": {
+    "hub_url": "",
+    "account_label": "",
+    "enroll_token": ""
+  },
+  "wifi": {
+    "ssid": "",
+    "password": "",
+    "hotspot_ssid": "",
+    "hotspot_password": ""
+  },
+  "alerts": {
+    "low_temp_enabled": true,
+    "low_temp_threshold_f": 35.0
+  }
+}

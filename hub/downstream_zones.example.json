@@ -1,0 +1,25 @@
+{
+  "zones": [
+    {
+      "id": "zone1-av-room",
+      "name": "AV Room Coil",
+      "parent_zone": "Zone 1",
+      "source_url": "http://100.100.100.100:8090/api/zone",
+      "delta_ok_f": 8.0
+    },
+    {
+      "id": "zone1-first-floor-prod",
+      "name": "1st Floor Production",
+      "parent_zone": "Zone 1",
+      "source_url": "http://100.100.100.101:8090/api/zone",
+      "delta_ok_f": 8.0
+    },
+    {
+      "id": "zone2-example",
+      "name": "Zone 2 Example",
+      "parent_zone": "Zone 2",
+      "source_url": "http://100.100.100.102:8090/api/zone",
+      "delta_ok_f": 8.0
+    }
+  ]
+}

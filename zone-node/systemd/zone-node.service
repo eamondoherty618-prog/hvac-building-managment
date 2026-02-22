@@ -1,0 +1,15 @@
+[Unit]
+Description=Heating Hub Zone Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eamondoherty618
+WorkingDirectory=/home/eamondoherty618
+ExecStart=/usr/bin/python3 /home/eamondoherty618/zone_node.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

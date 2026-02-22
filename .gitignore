@@ -1,0 +1,12 @@
+# Secrets / local runtime files
+**/alert_config.json
+**/zone_node_config.json
+**/hub_history.jsonl
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

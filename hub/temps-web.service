@@ -1,0 +1,15 @@
+[Unit]
+Description=Boiler Temps Web App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eamondoherty618
+WorkingDirectory=/home/eamondoherty618
+ExecStart=/usr/bin/python3 /home/eamondoherty618/temps_web.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
