@@ -68,6 +68,7 @@ def default_config():
         'unit_name': 'New Zone Node',
         'zone_id': '',
         'parent_zone': 'Zone 1',
+        'timezone': 'America/New_York',
         'feed_sensor_id': feed_id,
         'return_sensor_id': ret_id,
         'call_gpio': 17,
@@ -201,6 +202,7 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
         'unit_name': cfg.get('unit_name') or 'Unnamed Zone Node',
         'zone_id': cfg.get('zone_id') or '',
         'parent_zone': cfg.get('parent_zone') or '',
+        'timezone': cfg.get('timezone') or 'America/New_York',
         'feed_f': feed_f,
         'return_f': ret_f,
         'feed_sensor_id': feed_id,
@@ -286,13 +288,21 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
 .success-box{margin-top:12px;padding:12px;border:1px solid #bfe3d6;background:linear-gradient(180deg,#eefbf5,#f7fffb);border-radius:14px}
 .success-box h3{margin:0 0 6px;font-size:1rem;color:#0c5a48}
 .tabrow{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 8px}
-.segrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
-.segbtn{border:1px solid var(--line);background:#fff;color:#114b5f;padding:6px 10px;border-radius:999px;font-weight:700;cursor:pointer;box-shadow:none}
-.segbtn.active{background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border-color:transparent}
+.segrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;padding:4px;background:#f3f7fa;border:1px solid var(--line);border-radius:12px;width:max-content;max-width:100%}
+.segbtn{margin-top:0;background:transparent;color:#114b5f;border:1px solid transparent;padding:5px 10px;border-radius:9px;font-weight:700;font-size:.85rem;line-height:1.1;cursor:pointer;box-shadow:none}
+.segbtn.active{background:#ffffff;color:#0f4c5c;border-color:#d6e2e8;box-shadow:0 1px 4px rgba(15,76,92,.08)}
 .itab{border:1px solid var(--line);background:#fff;color:#114b5f;padding:6px 10px;border-radius:999px;font-weight:700;cursor:pointer;box-shadow:none}
 .itab.active{background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border-color:transparent}
 .itpanel{display:none;background:#f7fbfd;border:1px solid var(--line);border-radius:10px;padding:10px;font-size:.92rem}
 .itpanel.active{display:block}
+.live-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.live-item{border:1px solid var(--line);border-radius:12px;padding:10px;background:#f9fcfe}
+.live-k{font-size:.78rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.live-v{margin-top:4px;font-weight:700;font-size:1rem;color:#10242b}
+.live-v.temp{font-size:1.2rem}
+.ok-pill,.warn-pill{display:inline-block;padding:4px 8px;border-radius:999px;font-size:.8rem;font-weight:700}
+.ok-pill{background:#edf9f4;border:1px solid #bfe3d6;color:#0c5a48}
+.warn-pill{background:#fff2f2;border:1px solid #f0c6c6;color:#a61b1b}
 @media (max-width:760px){.wrap{padding:.75rem}.grid,.row{grid-template-columns:1fr}.hero{padding:16px}}
 </style>
 </head>
@@ -327,6 +337,22 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
               <option>Zone 3</option>
               <option>Other</option>
             </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Time Zone</label>
+            <select class="form-select" name="timezone">
+              <option value="America/New_York">Eastern (America/New_York)</option>
+              <option value="America/Chicago">Central (America/Chicago)</option>
+              <option value="America/Denver">Mountain (America/Denver)</option>
+              <option value="America/Los_Angeles">Pacific (America/Los_Angeles)</option>
+              <option value="UTC">UTC</option>
+            </select>
+          </div>
+          <div>
+            <label>Time Display</label>
+            <input value="Readable Local Time" disabled>
           </div>
         </div>
 
@@ -452,7 +478,10 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
     </div>
     <div class="card">
       <h2>Live Device Readings</h2>
-      <pre id="live">Loading...</pre>
+      <div id="liveSummary" class="live-grid">
+        <div class="live-item"><div class="live-k">Loading</div><div class="live-v">Waiting for device data...</div></div>
+      </div>
+      <pre id="live" class="hidden">Loading...</pre>
     </div>
   </div>
 </div>
@@ -481,14 +510,40 @@ function fillWifiSelect(sel, networks, current){
   blank.value='';
   blank.textContent='-- Select Wi-Fi Network --';
   sel.appendChild(blank);
+  const bars = (sig) => {
+    const n = Number(sig);
+    if (!Number.isFinite(n)) return '⋯';
+    if (n >= 75) return '▂▄▆█';
+    if (n >= 55) return '▂▄▆_';
+    if (n >= 35) return '▂▄__';
+    if (n > 0) return '▂___';
+    return '⋯';
+  };
   for(const n of (networks||[])){
     const o=document.createElement('option');
     o.value=n.ssid;
-    const sig = (n.signal===null || n.signal===undefined) ? '--' : n.signal;
-    o.textContent = `${n.ssid} (${sig}%)`;
+    const sec = n.security ? ` · ${n.security}` : '';
+    o.textContent = `${bars(n.signal)}  ${n.ssid}${sec}`;
     sel.appendChild(o);
   }
   if(current) sel.value = current;
+}
+function fmtDateTime(iso, tz){
+  if(!iso) return '--';
+  try {
+    return new Intl.DateTimeFormat([], {
+      timeZone: tz || undefined,
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZoneName: 'short'
+    }).format(new Date(iso));
+  } catch (e) {
+    try { return new Date(iso).toLocaleString(); } catch (_) { return iso; }
+  }
 }
 function setMsg(t){ document.getElementById('msg').textContent = t || ''; }
 function showSetupSuccess(show, text){
@@ -542,6 +597,7 @@ async function refreshAll(){
   f.unit_name.value = s.config.unit_name || '';
   f.zone_id.value = s.config.zone_id || '';
   f.parent_zone.value = s.config.parent_zone || 'Zone 1';
+  f.timezone.value = s.config.timezone || 'America/New_York';
   f.call_gpio.value = s.config.call_gpio || 17;
   f.low_temp_threshold_f.value = (s.config.alerts && s.config.alerts.low_temp_threshold_f != null) ? s.config.alerts.low_temp_threshold_f : 35;
   f.low_temp_enabled.value = (s.config.alerts && s.config.alerts.low_temp_enabled === false) ? 'false' : 'true';
@@ -559,8 +615,61 @@ async function refreshAll(){
   }
 }
 async function refreshLive(){
-  try { const data = await j('/api/zone?_=' + Date.now()); document.getElementById('live').textContent = JSON.stringify(data, null, 2); }
-  catch (e) { document.getElementById('live').textContent = 'Error: ' + e.message; }
+  try {
+    const data = await j('/api/zone?_=' + Date.now());
+    document.getElementById('live').textContent = JSON.stringify(data, null, 2);
+    const fmt = (v) => (v === null || v === undefined ? '--' : `${Number(v).toFixed(1)} °F`);
+    const feedErr = data.feed_error ? ` [${data.feed_error}]` : '';
+    const retErr = data.return_error ? ` [${data.return_error}]` : '';
+    const lowTempBadge = data.low_temp_alert
+      ? `<span class="warn-pill">Low Temp Warning</span>`
+      : `<span class="ok-pill">Normal</span>`;
+    const configuredBadge = data.configured
+      ? `<span class="ok-pill">Configured</span>`
+      : `<span class="warn-pill">Setup Required</span>`;
+    document.getElementById('liveSummary').innerHTML = `
+      <div class="live-item">
+        <div class="live-k">Device</div>
+        <div class="live-v">${data.unit_name || '--'}</div>
+        <div class="live-k" style="margin-top:8px">Status</div>
+        <div class="live-v">${configuredBadge}</div>
+      </div>
+      <div class="live-item">
+        <div class="live-k">Zone / Parent</div>
+        <div class="live-v">${data.zone_id || '--'} / ${data.parent_zone || '--'}</div>
+        <div class="live-k" style="margin-top:8px">Call Status</div>
+        <div class="live-v">${data.call_status || '--'}</div>
+      </div>
+      <div class="live-item">
+        <div class="live-k">Feed Temperature</div>
+        <div class="live-v temp">${fmt(data.feed_f)}</div>
+        <div class="live-k" style="margin-top:6px">Probe</div>
+        <div class="live-v" style="font-size:.88rem;font-weight:600">${data.feed_sensor_id || '--'}${feedErr}</div>
+      </div>
+      <div class="live-item">
+        <div class="live-k">Return Temperature</div>
+        <div class="live-v temp">${fmt(data.return_f)}</div>
+        <div class="live-k" style="margin-top:6px">Probe</div>
+        <div class="live-v" style="font-size:.88rem;font-weight:600">${data.return_sensor_id || '--'}${retErr}</div>
+      </div>
+      <div class="live-item">
+        <div class="live-k">Low Temp Status</div>
+        <div class="live-v">${lowTempBadge}</div>
+        <div class="live-k" style="margin-top:8px">Threshold</div>
+        <div class="live-v">${data.low_temp_threshold_f ?? '--'} °F</div>
+      </div>
+      <div class="live-item">
+        <div class="live-k">Updated (${data.timezone || 'Local'})</div>
+        <div class="live-v" style="font-size:.9rem">${fmtDateTime(data.updated_utc, data.timezone)}</div>
+        <div class="live-k" style="margin-top:8px">Wi-Fi</div>
+        <div class="live-v" style="font-size:.9rem">${data.wifi_ssid || '(not connected)'}</div>
+      </div>
+    `;
+  }
+  catch (e) {
+    document.getElementById('live').textContent = 'Error: ' + e.message;
+    document.getElementById('liveSummary').innerHTML = `<div class="live-item"><div class="live-k">Error</div><div class="live-v">${e.message}</div></div>`;
+  }
 }
 document.getElementById('setupForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
@@ -569,6 +678,7 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
     unit_name: f.unit_name.value.trim(),
     zone_id: f.zone_id.value.trim(),
     parent_zone: f.parent_zone.value.trim(),
+    timezone: f.timezone.value.trim(),
     feed_sensor_id: f.feed_sensor_id.value,
     return_sensor_id: f.return_sensor_id.value,
     call_gpio: Number(f.call_gpio.value || 17),
@@ -584,7 +694,7 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
   setMsg('Saving...');
   try {
     const res = await j('/api/setup', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    setMsg((res.message || 'Saved') + (res.wifi_apply && res.wifi_apply.ok ? '\nWi-Fi apply started.' : (res.wifi_apply ? ('\nWi-Fi apply issue: ' + (res.wifi_apply.stderr || res.wifi_apply.stdout || 'unknown')) : '')));
+    setMsg((res.message || 'Saved') + (res.wifi_apply && res.wifi_apply.ok ? '\\nWi-Fi apply started.' : (res.wifi_apply ? ('\\nWi-Fi apply issue: ' + (res.wifi_apply.stderr || res.wifi_apply.stdout || 'unknown')) : '')));
     if (res.configured) {
       const wifiOk = !res.wifi_apply || !!res.wifi_apply.ok;
       showSetupSuccess(true, wifiOk ? 'Setup Successful. This zone node is now configured and reporting.' : 'Configuration saved. Verify Wi-Fi connection, then continue.');
@@ -709,6 +819,7 @@ class H(BaseHTTPRequestHandler):
         cfg['unit_name'] = str(body.get('unit_name') or cfg.get('unit_name') or '').strip() or 'Unnamed Zone Node'
         cfg['zone_id'] = str(body.get('zone_id') or '').strip()
         cfg['parent_zone'] = str(body.get('parent_zone') or cfg.get('parent_zone') or 'Zone 1').strip()
+        cfg['timezone'] = str(body.get('timezone') or cfg.get('timezone') or 'America/New_York').strip() or 'America/New_York'
         cfg['feed_sensor_id'] = str(body.get('feed_sensor_id') or '').strip()
         cfg['return_sensor_id'] = str(body.get('return_sensor_id') or '').strip()
         try:
