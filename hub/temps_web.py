@@ -610,54 +610,59 @@ HTML = """<!doctype html>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
   <title>165 Water Street Heating Hub</title>
+  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">
   <style>
     :root {
-      --bg:#eef4f7; --ink:#13242d; --panel:#ffffff; --muted:#536b75; --border:#d6e2e8;
-      --ok:#0f766e; --warn:#9a3412; --bad:#b91c1c;
+      --bg:#edf3f6; --ink:#0f2029; --panel:#ffffff; --muted:#5e7480; --border:#d7e3ea;
+      --ok:#0f766e; --warn:#b45309; --bad:#b91c1c; --brand:#0f4c5c; --brand2:#168aad;
     }
     * { box-sizing:border-box; }
     body {
-      margin:0; padding:24px; min-height:100vh;
-      font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      margin:0; min-height:100vh;
+      font-family:Inter, ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       color:var(--ink);
       background:
-        radial-gradient(900px 500px at -10% -20%, #daeaf0 0%, transparent 60%),
-        radial-gradient(900px 500px at 120% 120%, #deebe9 0%, transparent 60%),
+        radial-gradient(900px 500px at -10% -20%, #d6e9f1 0%, transparent 60%),
+        radial-gradient(900px 500px at 120% 120%, #d7ede6 0%, transparent 60%),
         var(--bg);
     }
-    .wrap { max-width:1120px; margin:0 auto; }
+    .wrap { max-width:1180px; margin:0 auto; padding:1.1rem; }
     .head {
-      background:linear-gradient(130deg,#0f172a,#173a49 58%,#0f766e);
+      background:
+        radial-gradient(550px 220px at 10% 0%, rgba(255,255,255,.12), transparent 60%),
+        linear-gradient(130deg,#0b1320,#123447 55%,#0f766e);
       color:#f2fbff; border-radius:16px; padding:18px 20px;
-      box-shadow:0 14px 30px rgba(12,30,41,.24);
+      border:1px solid rgba(255,255,255,.08);
+      box-shadow:0 16px 34px rgba(12,30,41,.22);
       display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;
     }
     h1 { margin:0; font-size:clamp(1.55rem,2.8vw,2.2rem); }
     .meta { opacity:.9; font-size:.92rem; margin-top:4px; }
-    .pill { border:1px solid rgba(255,255,255,.35); border-radius:999px; padding:6px 12px; font-weight:700; background:rgba(255,255,255,.12); }
+    .pill { border:1px solid rgba(255,255,255,.26); border-radius:999px; padding:7px 12px; font-weight:700; background:rgba(255,255,255,.1); backdrop-filter: blur(4px); }
 
     .main-grid { margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; }
-    .card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:14px; box-shadow:0 8px 20px rgba(10,31,44,.09); }
+    .card { background:linear-gradient(180deg,#ffffff,#fbfdff); border:1px solid var(--border); border-radius:16px; padding:14px; box-shadow:0 10px 24px rgba(10,31,44,.08); }
     .card h2 { margin:0 0 10px; font-size:1.16rem; }
     .row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; border-top:1px solid var(--border); padding:10px 0; }
     .row:first-of-type { border-top:0; }
     .label { color:var(--muted); font-weight:700; }
     .sid { font-size:.78rem; color:var(--muted); margin-top:2px; }
-    .temp { font-size:1.65rem; font-weight:800; }
+    .temp { font-size:1.7rem; font-weight:800; letter-spacing:-0.02em; }
     .unit { color:var(--muted); margin-left:5px; }
 
-    .chart-wrap { margin-top:18px; background:var(--panel); border:1px solid var(--border); border-radius:14px; box-shadow:0 8px 20px rgba(10,31,44,.09); padding:14px; }
+    .chart-wrap { margin-top:18px; background:linear-gradient(180deg,#ffffff,#fbfdff); border:1px solid var(--border); border-radius:16px; box-shadow:0 10px 24px rgba(10,31,44,.08); padding:14px; }
     .chart-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }
     .btns,.tabs { display:flex; gap:8px; flex-wrap:wrap; }
     .btn,.tab {
-      border:1px solid var(--border); border-radius:999px; padding:5px 11px; font-weight:700; background:#fff; color:#1f3340; cursor:pointer;
+      border:1px solid var(--border); border-radius:999px; padding:6px 12px; font-weight:700; background:#fff; color:#1f3340; cursor:pointer;
+      box-shadow:0 2px 8px rgba(10,31,44,.04);
     }
-    .btn.active,.tab.active { background:#173a49; color:#fff; border-color:#173a49; }
+    .btn.active,.tab.active { background:linear-gradient(120deg,var(--brand),var(--brand2)); color:#fff; border-color:transparent; }
     canvas { width:100%; height:300px; margin-top:12px; border:1px solid var(--border); border-radius:10px; background:#fbfeff; }
     .legend { display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; font-size:.88rem; color:var(--muted); }
     .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; }
 
-    .subzones { margin-top:18px; background:var(--panel); border:1px solid var(--border); border-radius:14px; box-shadow:0 8px 20px rgba(10,31,44,.09); overflow:hidden; }
+    .subzones { margin-top:18px; background:linear-gradient(180deg,#ffffff,#fbfdff); border:1px solid var(--border); border-radius:16px; box-shadow:0 10px 24px rgba(10,31,44,.08); overflow:hidden; }
     .subzones-head { padding:12px 14px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
     .subzones-head h3 { margin:0; font-size:1.08rem; }
     table { width:100%; border-collapse:collapse; font-size:.93rem; }
@@ -669,7 +674,11 @@ HTML = """<!doctype html>
     .st-standby { color:var(--warn); }
     .st-trouble { color:var(--bad); }
 
+    .status-chip{display:inline-flex;align-items:center;gap:.4rem;padding:.2rem .55rem;border-radius:999px;background:#f3f8fb;border:1px solid var(--border)}
     @media (max-width:760px) {
+      .wrap { padding:.75rem; }
+      .head { padding:14px; border-radius:14px; }
+      .temp { font-size:1.35rem; }
       table,thead,tbody,th,td,tr { display:block; }
       thead { display:none; }
       tr { border-bottom:1px solid var(--border); padding:8px 10px; }
@@ -678,7 +687,7 @@ HTML = """<!doctype html>
     }
   </style>
 </head>
-<body>
+<body class=\"text-body\">
   <div class=\"wrap\">
     <header class=\"head\">
       <div>
@@ -729,12 +738,14 @@ HTML = """<!doctype html>
         <h3>Downstream Sub-Zones</h3>
         <div id=\"updated\" class=\"meta\">Updated: --</div>
       </div>
-      <table>
+      <div class=\"table-responsive\">
+      <table class=\"table table-hover align-middle mb-0\">
         <thead>
           <tr><th>Parent</th><th>Sub-Zone</th><th>Heat Call (24VAC)</th><th>Feed</th><th>Return</th><th>Status</th><th>Note</th></tr>
         </thead>
         <tbody id=\"subzoneBody\"></tbody>
       </table>
+      </div>
     </section>
   </div>
 

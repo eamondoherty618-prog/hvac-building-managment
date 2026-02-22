@@ -260,34 +260,39 @@ def html_page():
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Zone Setup</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
-:root{--bg:#eef4f7;--panel:#fff;--ink:#10242b;--muted:#5b717a;--line:#d8e2e7;--brand:#114b5f;}
-body{margin:0;padding:20px;background:linear-gradient(180deg,#eef4f7,#e7f1ef);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
-.wrap{max-width:980px;margin:0 auto}
-.hero{background:linear-gradient(130deg,#0f172a,#114b5f 55%,#0f766e);color:#effcff;border-radius:16px;padding:18px 20px;box-shadow:0 10px 30px rgba(0,0,0,.15)}
+:root{--bg:#edf3f6;--panel:#fff;--ink:#10242b;--muted:#5b717a;--line:#d8e2e7;--brand:#114b5f;--brand2:#0f766e}
+body{margin:0;padding:0;background:linear-gradient(180deg,#eef4f7,#e6efee);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
+.wrap{max-width:1100px;margin:0 auto;padding:1rem}
+.hero{background:radial-gradient(500px 200px at 5% 0%,rgba(255,255,255,.12),transparent 60%),linear-gradient(130deg,#0f172a,#114b5f 55%,#0f766e);color:#effcff;border-radius:18px;padding:20px 22px;box-shadow:0 14px 32px rgba(0,0,0,.14);border:1px solid rgba(255,255,255,.08)}
 .hero h1{margin:0;font-size:1.35rem}.hero p{margin:.35rem 0 0;opacity:.95}
 .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:14px;margin-top:14px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 6px 18px rgba(10,31,44,.08)}
+.card{background:linear-gradient(180deg,#fff,#fbfdff);border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:0 10px 24px rgba(10,31,44,.07)}
 .card h2{margin:0 0 10px;font-size:1.02rem}
-label{display:block;font-size:.88rem;color:var(--muted);font-weight:700;margin:10px 0 4px}
-input,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:15px;background:#fff}
-button{margin-top:10px;background:#114b5f;color:#fff;border:0;padding:10px 14px;border-radius:10px;font-weight:700;cursor:pointer}
-button.secondary{background:#fff;color:#114b5f;border:1px solid var(--line)}
+label{display:block;font-size:.82rem;color:var(--muted);font-weight:700;margin:10px 0 4px;text-transform:uppercase;letter-spacing:.03em}
+input,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:12px;font-size:15px;background:#fff}
+input:focus,select:focus{outline:none;border-color:#8bc2d3;box-shadow:0 0 0 4px rgba(22,138,173,.12)}
+button{margin-top:10px;background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border:0;padding:10px 14px;border-radius:12px;font-weight:700;cursor:pointer;box-shadow:0 8px 20px rgba(17,75,95,.15)}
+button.secondary{background:#fff;color:#114b5f;border:1px solid var(--line);box-shadow:none}
 button.warn{background:#8a2d12}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-pre{background:#f7fbfd;border:1px solid var(--line);padding:10px;border-radius:10px;overflow:auto;font-size:.83rem;max-height:520px}
-.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#edf6f9;border:1px solid #cfe0e8;color:#114b5f;font-weight:700;font-size:.8rem}
-small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line);padding:5px 8px;border-radius:999px;background:#f7fbfd;margin-right:6px;font-size:.85rem}
+pre{background:#f7fbfd;border:1px solid var(--line);padding:12px;border-radius:12px;overflow:auto;font-size:.82rem;max-height:560px}
+.badge{display:inline-block;padding:6px 10px;border-radius:999px;background:#edf6f9;border:1px solid #cfe0e8;color:#114b5f;font-weight:700;font-size:.8rem}
+small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line);padding:6px 10px;border-radius:999px;background:#f7fbfd;margin-right:6px;font-size:.85rem}
 #msg{margin-top:10px;font-weight:700;color:#114b5f;white-space:pre-wrap}
 .hidden{display:none}
-.success-box{margin-top:12px;padding:12px;border:1px solid #bfe3d6;background:#eefbf5;border-radius:12px}
+.success-box{margin-top:12px;padding:12px;border:1px solid #bfe3d6;background:linear-gradient(180deg,#eefbf5,#f7fffb);border-radius:14px}
 .success-box h3{margin:0 0 6px;font-size:1rem;color:#0c5a48}
 .tabrow{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 8px}
-.itab{border:1px solid var(--line);background:#fff;color:#114b5f;padding:6px 10px;border-radius:999px;font-weight:700;cursor:pointer}
-.itab.active{background:#114b5f;color:#fff;border-color:#114b5f}
+.segrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.segbtn{border:1px solid var(--line);background:#fff;color:#114b5f;padding:6px 10px;border-radius:999px;font-weight:700;cursor:pointer;box-shadow:none}
+.segbtn.active{background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border-color:transparent}
+.itab{border:1px solid var(--line);background:#fff;color:#114b5f;padding:6px 10px;border-radius:999px;font-weight:700;cursor:pointer;box-shadow:none}
+.itab.active{background:linear-gradient(120deg,var(--brand),var(--brand2));color:#fff;border-color:transparent}
 .itpanel{display:none;background:#f7fbfd;border:1px solid var(--line);border-radius:10px;padding:10px;font-size:.92rem}
 .itpanel.active{display:block}
-@media (max-width:760px){.grid,.row{grid-template-columns:1fr}}
+@media (max-width:760px){.wrap{padding:.75rem}.grid,.row{grid-template-columns:1fr}.hero{padding:16px}}
 </style>
 </head>
 <body>
@@ -368,10 +373,18 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <div class="row">
           <div>
             <label>Wi-Fi SSID</label>
-            <select name="wifi_ssid" id="wifiSsidSel"></select>
-            <div style="margin-top:6px"><button type="button" class="secondary" id="scanWifiBtn">Scan Wi-Fi Networks</button></div>
-            <label style="margin-top:8px">Or Enter Wi-Fi SSID Manually</label>
-            <input name="wifi_ssid_manual" placeholder="Type Wi-Fi name if scan is unavailable">
+            <div class="segrow">
+              <button type="button" class="segbtn active" id="wifiModeSelectBtn">Select Network</button>
+              <button type="button" class="segbtn" id="wifiModeManualBtn">Type Manually</button>
+            </div>
+            <div id="wifiSelectWrap">
+              <select name="wifi_ssid" id="wifiSsidSel"></select>
+              <div style="margin-top:6px"><button type="button" class="secondary" id="scanWifiBtn">Scan Wi-Fi Networks</button></div>
+            </div>
+            <div id="wifiManualWrap" class="hidden">
+              <label style="margin-top:8px">Wi-Fi SSID (Manual)</label>
+              <input name="wifi_ssid_manual" placeholder="Type Wi-Fi name if scan is unavailable">
+            </div>
           </div>
           <div>
             <label>Wi-Fi Password</label>
@@ -434,7 +447,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
         </div>
       </div>
-      <small>Setup hotspot stays on during onboarding. Connect in iPhone Wi-Fi settings to <code>HeatingHub-Setup-xxxx</code>, then open <code>http://10.42.0.1:8090</code>. After Wi-Fi credentials are saved and the node joins your network, setup hotspot can be shut off automatically in the next deploy.</small>
+      <small>Setup hotspot stays on during onboarding. Connect in iPhone Wi-Fi settings to <code>HeatingHub-Setup-xxxx</code>, then open <code>http://10.42.0.1:8090</code>. If Wi-Fi scan is unavailable in hotspot mode, use the manual SSID field.</small>
     </div>
     <div class="card">
       <h2>Live Device Readings</h2>
@@ -493,6 +506,13 @@ function activateInstructionTab(name){
   document.querySelectorAll('[data-itab]').forEach(b => b.classList.toggle('active', b.dataset.itab === name));
   document.querySelectorAll('[data-ipanel]').forEach(p => p.classList.toggle('active', p.dataset.ipanel === name));
 }
+function setWifiMode(mode){
+  const selectMode = mode !== 'manual';
+  document.getElementById('wifiSelectWrap').classList.toggle('hidden', !selectMode);
+  document.getElementById('wifiManualWrap').classList.toggle('hidden', selectMode);
+  document.getElementById('wifiModeSelectBtn').classList.toggle('active', selectMode);
+  document.getElementById('wifiModeManualBtn').classList.toggle('active', !selectMode);
+}
 async function refreshWifiStatus(){
   try {
     const w = await j('/api/wifi/status?_=' + Date.now());
@@ -510,7 +530,8 @@ async function refreshWifiScan(){
     const current = (f.wifi_ssid_manual.value || f.wifi_ssid.value || '').trim();
     fillWifiSelect(document.getElementById('wifiSsidSel'), s.networks || [], current);
   } catch (e) {
-    setMsg('Wi-Fi scan unavailable (common while setup hotspot is active). You can type the Wi-Fi name manually.');
+    setWifiMode('manual');
+    setMsg('Wi-Fi scan unavailable (common while setup hotspot is active). Use the Type Manually tab for Wi-Fi name.');
   }
 }
 async function refreshAll(){
@@ -525,6 +546,7 @@ async function refreshAll(){
   f.low_temp_enabled.value = (s.config.alerts && s.config.alerts.low_temp_enabled === false) ? 'false' : 'true';
   fillWifiSelect(document.getElementById('wifiSsidSel'), [], (s.config.wifi && s.config.wifi.ssid) || '');
   f.wifi_ssid_manual.value = (s.config.wifi && s.config.wifi.ssid) || '';
+  setWifiMode((s.config.wifi && s.config.wifi.ssid) ? 'manual' : 'select');
   f.wifi_password.value = '';
   f.hub_url.value = (s.config.hub && s.config.hub.hub_url) || '';
   f.account_label.value = (s.config.hub && s.config.hub.account_label) || '';
@@ -575,6 +597,8 @@ document.getElementById('wifiSsidSel').addEventListener('change', ()=>{
   const f = document.getElementById('setupForm');
   if (f.wifi_ssid.value) f.wifi_ssid_manual.value = f.wifi_ssid.value;
 });
+document.getElementById('wifiModeSelectBtn').addEventListener('click', ()=> setWifiMode('select'));
+document.getElementById('wifiModeManualBtn').addEventListener('click', ()=> setWifiMode('manual'));
 document.getElementById('swapProbesBtn').addEventListener('click', ()=>{
   const f = document.getElementById('feedSel');
   const r = document.getElementById('returnSel');
