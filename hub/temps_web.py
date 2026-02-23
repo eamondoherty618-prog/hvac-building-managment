@@ -223,6 +223,7 @@ def default_site_map_config():
         "zoom": 16,
         "building_floors": 1,
         "map_layer": "street",
+        "building_confirm_pin": None,
         "building_outline": None,
         "pins": {},
         "updated_utc": now_utc_iso(),
@@ -367,6 +368,15 @@ def load_site_map_config():
         except Exception:
             pass
         cfg["map_layer"] = str(data.get("map_layer") or "street")
+        bcp = data.get("building_confirm_pin")
+        if isinstance(bcp, dict):
+            try:
+                cfg["building_confirm_pin"] = {
+                    "lat": float(bcp.get("lat")),
+                    "lng": float(bcp.get("lng")),
+                }
+            except Exception:
+                pass
         bo = data.get("building_outline")
         if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
             cfg["building_outline"] = bo
@@ -398,6 +408,7 @@ def load_site_map_config():
                 "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
                 "pump_serial": str(p.get("pump_serial") or ""),
                 "pump_service_notes": str(p.get("pump_service_notes") or ""),
+                "main_boiler_floor": str(p.get("main_boiler_floor") or ""),
                 "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                 "description": str(p.get("description") or ""),
                 "photo_data_url": str(p.get("photo_data_url") or ""),
@@ -434,6 +445,15 @@ def save_site_map_config(cfg):
             except Exception:
                 pass
             cfg_out["map_layer"] = str(cfg.get("map_layer") or "street")
+            bcp = cfg.get("building_confirm_pin")
+            if isinstance(bcp, dict):
+                try:
+                    cfg_out["building_confirm_pin"] = {
+                        "lat": float(bcp.get("lat")),
+                        "lng": float(bcp.get("lng")),
+                    }
+                except Exception:
+                    pass
             bo = cfg.get("building_outline")
             if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
                 cfg_out["building_outline"] = bo
@@ -466,6 +486,7 @@ def save_site_map_config(cfg):
                         "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
                         "pump_serial": str(p.get("pump_serial") or ""),
                         "pump_service_notes": str(p.get("pump_service_notes") or ""),
+                        "main_boiler_floor": str(p.get("main_boiler_floor") or ""),
                         "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                         "description": str(p.get("description") or ""),
                         "photo_data_url": str(p.get("photo_data_url") or ""),
@@ -1832,6 +1853,19 @@ HTML = """<!doctype html>
       background:#f9fcfe; box-shadow:0 24px 64px rgba(10,31,44,.28);
     }
     .site-map-card.workspace #siteMapCanvas{height:min(62vh,620px)}
+    .site-map-card.building-setup-mode #siteMapZoneSelectWrap{display:none}
+    .site-map-card.building-setup-mode #siteMapZoneMappingSection{display:none !important}
+    .site-map-card.building-setup-mode #siteMapZoneWizard{display:none !important}
+    .site-map-card.building-setup-mode #siteMapClearPinBtn,
+    .site-map-card.building-setup-mode #siteMapZoneSetupBtn,
+    .site-map-card.building-setup-mode #siteMapSaveBtn{display:none}
+    .site-map-card.zone-setup-mode #siteMapOutlineWizard:not(.show){display:none}
+    .site-map-zone-wizard{display:none;margin-top:10px;border:1px solid var(--border);border-radius:12px;background:#fff;padding:12px}
+    .site-map-zone-wizard.show{display:block}
+    .site-map-zone-wizard .mode-tabs{display:flex;gap:8px;flex-wrap:wrap}
+    .site-map-zone-wizard .mode-tabs .btn{padding:4px 10px;font-size:.85rem}
+    .site-map-zone-wizard .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .site-map-zone-wizard .actions .btn{padding:4px 10px;font-size:.85rem}
     body.map-workspace-open{overflow:hidden}
     .site-map-wizard{display:none;margin-top:10px;border:1px solid var(--border);border-radius:12px;background:#fff;padding:12px}
     .site-map-wizard.show{display:block}
@@ -1839,10 +1873,64 @@ HTML = """<!doctype html>
     .site-map-wizard .step{border:1px solid var(--border);border-radius:10px;padding:8px;background:#f8fbfd}
     .site-map-wizard .step.active{border-color:#8bc2d3;background:#eef8fc}
     .site-map-wizard .step.done{border-color:#b8e0c7;background:#f1fbf5}
+    .site-map-wizard .step.next-required{border-color:#f59e0b;background:#fff7e6;box-shadow:inset 0 0 0 1px rgba(245,158,11,.25)}
     .site-map-wizard .step .n{font-weight:800;font-size:.75rem;color:var(--muted)}
     .site-map-wizard .step .t{font-weight:700;margin-top:2px}
     .site-map-wizard .step .s{font-size:.82rem;color:var(--muted);margin-top:4px}
     .site-map-wizard .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .site-map-card.workspace .site-map-wizard.show{
+      position:sticky; top:70px; z-index:1910; margin-top:8px;
+      display:flex; flex-direction:column; gap:8px;
+      padding:10px; border-radius:12px;
+      box-shadow:0 10px 24px rgba(10,31,44,.12);
+    }
+    .site-map-card.workspace .site-map-wizard > *{margin-top:0 !important}
+    .site-map-card.workspace .site-map-wizard > :nth-child(5){order:2} /* actions */
+    .site-map-card.workspace .site-map-wizard > :nth-child(2){order:3} /* status */
+    .site-map-card.workspace .site-map-wizard > :nth-child(3){order:4} /* progress */
+    .site-map-card.workspace .site-map-wizard > :nth-child(4){order:5} /* steps */
+    .site-map-card.workspace .site-map-wizard > :nth-child(6){order:6} /* form grid */
+    .site-map-card.workspace .site-map-wizard .steps{
+      display:flex; flex-wrap:nowrap; overflow:auto; gap:6px; padding-bottom:2px;
+      scrollbar-width:thin;
+    }
+    .site-map-card.workspace .site-map-wizard .step{
+      min-width:150px; padding:6px 8px; background:#f8fbfd;
+    }
+    .site-map-card.workspace .site-map-wizard .step .s{display:none}
+    .site-map-card.workspace .site-map-wizard .step .t{font-size:.86rem}
+    .site-map-card.workspace .site-map-wizard .step .n{font-size:.7rem}
+    .site-map-card.workspace .site-map-wizard .actions{
+      position:sticky; top:0; z-index:1; margin-top:0;
+      background:#fff; padding-bottom:2px;
+    }
+    .site-map-card.workspace .site-map-wizard .actions .btn{padding:3px 8px;font-size:.82rem}
+    .site-map-card.workspace .site-map-wizard .form-grid{gap:8px}
+    .site-map-card.workspace .site-map-wizard .msg{font-size:.85rem}
+    .site-map-card.workspace .site-map-wizard .smallnote{font-size:.78rem}
+    .site-map-card.workspace .site-map-wizard.compact-early .form-grid{display:none}
+    .site-map-card.workspace .site-map-wizard.compact-early .steps{margin-top:4px}
+    .site-map-card.workspace .site-map-wizard.compact-early .step{min-width:130px}
+    .site-map-card.workspace .site-map-wizard.compact-early.show{
+      position:absolute; top:126px; left:10px; right:10px; z-index:1915;
+      max-height:min(34vh,220px); overflow:auto;
+      margin-top:0;
+    }
+    .site-map-card.workspace .site-map-wizard.compact-early.show .steps{display:none}
+    .site-map-card.workspace .site-map-wizard.compact-early.show #siteMapOutlineProgress{display:none}
+    .site-map-card.workspace .site-map-wizard.compact-early.show .actions{
+      position:static; background:transparent; padding-bottom:0;
+    }
+    .site-map-card.workspace.step-map-focus .site-map-tools{display:none}
+    .site-map-card.workspace.step-map-focus #siteMapZoneMappingLockedNote{display:none !important}
+    .site-map-card.workspace.step-map-focus #siteMapCanvas{
+      display:block !important;
+      height:clamp(360px, 58vh, 700px);
+      margin-top:8px;
+    }
+    .site-map-card.workspace.step-map-focus #siteMapPinsList{display:none}
+    .site-map-card.workspace.step-map-focus .site-map-subtools{display:none}
+    .site-map-card.workspace.step-map-focus .form-grid{display:none}
     .pin-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;margin-top:10px}
     .pin-chip{border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:#f8fbfd}
     .pin-chip .t{font-weight:700}
@@ -1872,6 +1960,7 @@ HTML = """<!doctype html>
       .site-map-workspace-bar{flex-direction:column;align-items:stretch}
       .site-map-workspace-bar .left,.site-map-workspace-bar .right{width:100%}
       .site-map-card.workspace{inset:8px}
+      .site-map-card.workspace .site-map-wizard.show{top:8px}
       #siteMapCanvas{height:320px}
       table,thead,tbody,th,td,tr { display:block; }
       thead { display:none; }
@@ -2169,7 +2258,7 @@ HTML = """<!doctype html>
       </div>
 
       <div id=\"adminZonesPanel\" class=\"hidden\" style=\"margin-top:12px\">
-        <div id=\"siteMapCard\" class=\"card site-map-card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+        <div id=\"zoneMgmtCard\" class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
           <h4 style=\"margin:0 0 8px\">Zone Management (Adopted Devices)</h4>
           <div class=\"smallnote\">Post-install changes and diagnostics for adopted zone nodes. Use this instead of the setup page for normal service updates.</div>
           <div class=\"form-grid\" style=\"margin-top:10px\">
@@ -2249,7 +2338,7 @@ HTML = """<!doctype html>
       </div>
 
       <div id=\"adminMapPanel\" class=\"hidden\" style=\"margin-top:12px\">
-        <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+        <div id=\"siteMapCard\" class=\"card site-map-card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
           <h4 style=\"margin:0 0 8px\">Building / Zone Device Map</h4>
           <div class=\"smallnote\">Enter the building address, zoom in, then select a zone/device and click the map to place a rough pin location.</div>
           <div class=\"site-map-tools\" style=\"margin-top:10px\">
@@ -2257,7 +2346,7 @@ HTML = """<!doctype html>
               <label class=\"label\" for=\"siteAddress\">Building Address</label>
               <input id=\"siteAddress\" class=\"input\" placeholder=\"165 Water Street, New Haven, CT\">
             </div>
-            <div>
+            <div id=\"siteMapZoneSelectWrap\">
               <label class=\"label\" for=\"siteMapZoneSelect\">Zone / Device</label>
               <select id=\"siteMapZoneSelect\" class=\"select\"></select>
               <div class=\"smallnote\">Only adopted/assigned zone devices appear here (plus Zone 1 and Zone 2 main).</div>
@@ -2265,6 +2354,8 @@ HTML = """<!doctype html>
             <button type=\"button\" class=\"btn\" id=\"siteMapFindBtn\">Find Address</button>
             <button type=\"button\" class=\"btn active\" id=\"siteMapSaveBtn\">Save Map</button>
           </div>
+          <div id=\"siteMapZoneMappingLockedNote\" class=\"msg\" style=\"display:none;margin-top:8px\">Complete Building Setup first (find address, confirm building pin, draw outline, and save floor count). Zone/device mapping unlocks after that and uses this shared building layout for all zones.</div>
+          <div id=\"siteMapZoneMappingSection\">
           <div class=\"site-map-subtools\">
             <div>
               <label class=\"label\" for=\"siteMapLayer\">Map View</label>
@@ -2281,7 +2372,8 @@ HTML = """<!doctype html>
               <label class=\"label\" for=\"siteMapCenter\">Map Center</label>
               <input id=\"siteMapCenter\" class=\"input\" readonly placeholder=\"Lat, Lng\">
             </div>
-            <button type=\"button\" class=\"btn\" id=\"siteMapFootprintBtn\">Building Outline Setup</button>
+            <button type=\"button\" class=\"btn\" id=\"siteMapFootprintBtn\">Building Setup</button>
+            <button type=\"button\" class=\"btn\" id=\"siteMapZoneSetupBtn\">Zone Setup</button>
             <button type=\"button\" class=\"btn\" id=\"siteMapClearPinBtn\">Clear Selected Pin</button>
           </div>
           <div class=\"site-map-subtools\" style=\"margin-top:8px\">
@@ -2382,6 +2474,7 @@ HTML = """<!doctype html>
               <img id=\"siteMapPhotoPreview\" alt=\"Zone photo preview\" style=\"max-width:280px;width:100%;display:none;border:1px solid var(--border);border-radius:10px;background:#f4f8fb\"/>
             </div>
           </div>
+          </div>
           <div id=\"siteMapWorkspaceBar\" class=\"site-map-workspace-bar\">
             <div class=\"left\">
               <strong id=\"siteMapWorkspaceTitle\">Map Workspace</strong>
@@ -2397,16 +2490,16 @@ HTML = """<!doctype html>
             <div style=\"display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap\">
               <div>
                 <strong>Building Outline Setup</strong>
-                <div class=\"smallnote\">Follow the steps to locate the building, load or draw the outline, then save.</div>
+                <div class=\"smallnote\">Find address, click the building to confirm it, draw the outline, set floors, then continue (press Enter).</div>
               </div>
-              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineWizardCloseBtn\">Close Outline Setup</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineWizardCloseBtn\">Exit Building Setup</button>
             </div>
             <div id=\"siteMapOutlineWizardStatus\" class=\"msg\" style=\"margin-top:8px\"></div>
             <div id=\"siteMapOutlineProgress\" class=\"smallnote\" style=\"margin-top:6px\"></div>
             <div class=\"steps\" id=\"siteMapOutlineWizardSteps\">
               <div class=\"step\" data-step=\"1\"><div class=\"n\">Step 1</div><div class=\"t\">Find Address</div><div class=\"s\">Locate and center the building on the map.</div></div>
-              <div class=\"step\" data-step=\"2\"><div class=\"n\">Step 2</div><div class=\"t\">Auto Detect Outline</div><div class=\"s\">Try importing a building outline from map data.</div></div>
-              <div class=\"step\" data-step=\"3\"><div class=\"n\">Step 3</div><div class=\"t\">Draw Outline Manually</div><div class=\"s\">Tap the map to sketch building boundaries if needed.</div></div>
+              <div class=\"step\" data-step=\"2\"><div class=\"n\">Step 2</div><div class=\"t\">Confirm Building Pin</div><div class=\"s\">Click the building on the map to confirm the correct structure.</div></div>
+              <div class=\"step\" data-step=\"3\"><div class=\"n\">Step 3</div><div class=\"t\">Draw Building Outline</div><div class=\"s\">Auto detect or draw the building boundary on the map.</div></div>
               <div class=\"step\" data-step=\"4\"><div class=\"n\">Step 4</div><div class=\"t\">Set Floor Count</div><div class=\"s\">Enter how many floors the building has.</div></div>
               <div class=\"step\" data-step=\"5\"><div class=\"n\">Step 5</div><div class=\"t\">Assign Zone Colors</div><div class=\"s\">Apply parent-zone colors to downstream zones.</div></div>
               <div class=\"step\" data-step=\"6\"><div class=\"n\">Step 6</div><div class=\"t\">Main Boiler Location</div><div class=\"s\">Mark where the main boiler/circulator is on the map.</div></div>
@@ -2414,11 +2507,12 @@ HTML = """<!doctype html>
             </div>
             <div class=\"actions\">
               <button type=\"button\" class=\"btn\" id=\"siteMapOutlineStepFindBtn\">Find Address</button>
-              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineStepAutoBtn\">Auto Detect Outline</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineStepAutoBtn\">Auto Detect (Optional)</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapOutlineStartDrawBtn\">Start Manual Outline</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapOutlineUndoBtn\">Undo Last Point</button>
-              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineFinishDrawBtn\">Finish Manual Outline</button>
-              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineClearBtn\">Clear Outline</button>
+              <button type=\"button\" class=\"btn active\" id=\"siteMapOutlineFinishDrawBtn\">Finish Manual Outline</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapOutlineClearBtn\">Clear All Points</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapOutlinePrevStepBtn\">Previous Step</button>
             </div>
             <div class=\"form-grid\" style=\"margin-top:10px\">
               <div>
@@ -2427,7 +2521,8 @@ HTML = """<!doctype html>
               </div>
               <div style=\"display:flex;align-items:end;gap:8px\">
                 <button type=\"button\" class=\"btn\" id=\"siteMapOutlineFloorsSaveBtn\">Save Floor Count</button>
-                <button type=\"button\" class=\"btn\" id=\"siteMapOutlineNextStepBtn\">Next Step (Enter)</button>
+                <button type=\"button\" class=\"btn\" id=\"siteMapOutlineNextStepBtn\">Continue (Enter)</button>
+                <button type=\"button\" class=\"btn active\" id=\"siteMapOutlineContinueZoneSetupBtn\" style=\"display:none\">Continue to Zone Setup</button>
               </div>
               <div class=\"full\">
                 <div class=\"smallnote\">Zone colors are automatically inherited from the parent zone (Zone 1 / Zone 2) for consistent mapping.</div>
@@ -2439,14 +2534,36 @@ HTML = """<!doctype html>
               </div>
             </div>
           </div>
-          <div id=\"siteMapCanvas\" style=\"margin-top:10px\"></div>
+          <div id=\"siteMapZoneWizard\" class=\"site-map-zone-wizard\">
+            <div style=\"display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap\">
+              <div>
+                <strong>Zone Setup</strong>
+                <div class=\"smallnote\">Use the saved building outline as the base. Place all zone pins and areas inside the building outline.</div>
+              </div>
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardExitBtn\">Exit Zone Setup</button>
+            </div>
+            <div class=\"mode-tabs\" style=\"margin-top:8px\">
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardMainTabBtn\">Main Zones</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardDownstreamTabBtn\">Downstream Zones</button>
+            </div>
+            <div id=\"siteMapZoneWizardStatus\" class=\"msg\" style=\"margin-top:8px\"></div>
+            <div id=\"siteMapZoneWizardMainActions\" class=\"actions\">
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardPinZone1Btn\">Pin Zone 1 Main Boiler</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardPinZone2Btn\">Pin Zone 2 Main Boiler</button>
+            </div>
+            <div id=\"siteMapZoneWizardDownstreamActions\" class=\"actions hidden\">
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardRefreshZoneBtn\">Refresh Zone Selection</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardStartAreaBtn\">Start Zone Area (Optional)</button>
+            </div>
+          </div>
+          <div id=\"siteMapCanvas\" tabindex=\"0\" style=\"margin-top:10px\"></div>
           <div id=\"siteMapDrawHint\" class=\"smallnote\" style=\"display:none;margin-top:8px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;background:#f8fbff\"></div>
           <div style=\"display:flex;gap:8px;flex-wrap:wrap;margin-top:8px\">
             <button type=\"button\" class=\"btn\" id=\"siteMapAreaUndoBtn\">Undo Last Area Point</button>
           </div>
-          <div class=\"smallnote\" style=\"margin-top:8px\">Tip: Choose a zone/device, then tap the map to place a pin. Use Start Zone Area to sketch a rough served area polygon.</div>
-          <div id=\"siteMapMsg\" class=\"msg\"></div>
+          <div class=\"smallnote\" style=\"margin-top:8px\">Tip: Complete Building Setup first. In Zone Setup, choose a zone/device and place pins or zone areas inside the saved building outline.</div>
           <div id=\"siteMapPinsList\" class=\"pin-list\"></div>
+          <div id=\"siteMapMsg\" class=\"msg\"></div>
         </div>
       </div>
 
@@ -2569,6 +2686,7 @@ HTML = """<!doctype html>
           <div id=\"zoneInfoPumpVoltageRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Voltage</div></div><div id=\"zoneInfoPumpVoltage\">--</div></div>
           <div id=\"zoneInfoPumpSpeedModeRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Speed / ECM Mode</div></div><div id=\"zoneInfoPumpSpeedMode\">--</div></div>
           <div id=\"zoneInfoPumpSerialRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Serial #</div></div><div id=\"zoneInfoPumpSerial\">--</div></div>
+          <div id=\"zoneInfoMainBoilerFloorRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Main Boiler Floor</div></div><div id=\"zoneInfoMainBoilerFloor\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Circuit / Breaker</div></div><div id=\"zoneInfoBreaker\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Installed By</div></div><div id=\"zoneInfoInstalledBy\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Install Date</div></div><div id=\"zoneInfoInstallDate\">--</div></div>
@@ -2614,6 +2732,7 @@ HTML = """<!doctype html>
     let siteMapMap = null;
     let siteMapMarkers = {};
     let siteMapZonePolygons = {};
+    let siteMapBuildingConfirmMarker = null;
     let siteMapBaseLayers = {};
     let siteMapActiveLayerKey = "street";
     let siteMapBuildingOutlineLayer = null;
@@ -2625,7 +2744,10 @@ HTML = """<!doctype html>
     let siteMapDrawingBuildingOutline = false;
     let siteMapDraftBuildingOutlinePoints = [];
     let siteMapDraftBuildingOutlineLayer = null;
+    let siteMapDraftBuildingOutlinePointsLayer = null;
+    let siteMapMainBoilerFloorPopupZoneId = "";
     let siteMapWorkspaceOpen = false;
+    let siteMapSetupMode = "none";
     let siteMapReady = false;
     const livePoints = [];
     const LIVE_MAX_POINTS = 240;
@@ -2778,15 +2900,17 @@ HTML = """<!doctype html>
       if (!el) return;
       const s = state || {};
       const hasAddress = !!s.hasAddress;
+      const hasConfirm = !!s.hasConfirm;
       const hasOutline = !!s.hasOutline;
       const drawing = !!s.drawing;
       const floorsSet = Number((siteMapConfig && siteMapConfig.building_floors) || 0) >= 1;
       const colorsAssigned = areParentColorsAppliedToZones();
       const boilerPinned = !!(getSiteMapPin("zone1_main") || getSiteMapPin("zone2_main"));
-      const readyToSave = hasOutline && !drawing && floorsSet && colorsAssigned && boilerPinned;
+      const readyToSave = hasAddress && hasConfirm && hasOutline && !drawing && floorsSet && colorsAssigned && boilerPinned;
       const item = (ok, label) => `${ok ? "✓" : "○"} ${label}`;
       el.textContent = [
         item(hasAddress, "Address Found"),
+        item(hasConfirm, "Building Confirmed"),
         item(hasOutline, "Building Outline Ready"),
         item(floorsSet, "Floor Count Set"),
         item(colorsAssigned, "Zone Colors Assigned"),
@@ -2797,26 +2921,45 @@ HTML = """<!doctype html>
 
     function renderOutlineWizardSteps() {
       const stepsWrap = document.getElementById("siteMapOutlineWizardSteps");
+      const wiz = document.getElementById("siteMapOutlineWizard");
+      const card = document.getElementById("siteMapCard");
       if (!stepsWrap) return;
       const hasAddress = !!String(document.getElementById("siteAddress")?.value || "").trim();
+      const hasConfirm = !!(siteMapConfig && siteMapConfig.building_confirm_pin);
       const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
       const drawing = !!siteMapDrawingBuildingOutline;
+      const floorsSet = Number((siteMapConfig && siteMapConfig.building_floors) || 0) >= 1;
+      const colorsAssigned = areParentColorsAppliedToZones();
+      const boilerPinned = !!(getSiteMapPin("zone1_main") || getSiteMapPin("zone2_main"));
+      const doneByStep = {
+        1: hasAddress,
+        2: hasConfirm,
+        3: hasOutline && !drawing,
+        4: hasOutline && floorsSet,
+        5: colorsAssigned,
+        6: boilerPinned,
+        7: hasAddress && hasConfirm && hasOutline && !drawing && floorsSet && colorsAssigned && boilerPinned,
+      };
+      let nextRequired = 7;
+      for (let i = 1; i <= 7; i++) {
+        if (!doneByStep[i]) { nextRequired = i; break; }
+      }
       stepsWrap.querySelectorAll(".step").forEach((el) => {
         const n = Number(el.dataset.step || 0);
         el.classList.toggle("active", n === siteMapOutlineWizardStep);
-        el.classList.remove("done");
+        el.classList.toggle("done", !!doneByStep[n]);
+        el.classList.toggle("next-required", n === nextRequired && !doneByStep[n]);
       });
-      if (hasAddress) stepsWrap.querySelector('[data-step="1"]')?.classList.add("done");
-      if (hasOutline) stepsWrap.querySelector('[data-step="2"]')?.classList.add("done");
-      if (hasOutline && !drawing) stepsWrap.querySelector('[data-step="3"]')?.classList.add("done");
-      if (hasOutline) stepsWrap.querySelector('[data-step="4"]')?.classList.add("done");
-      renderOutlineWizardProgress({ hasAddress, hasOutline, drawing });
-      updateOutlineWizardActionStates({ hasAddress, hasOutline, drawing });
+      if (wiz) wiz.classList.toggle("compact-early", !!siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) <= 3);
+      if (card) card.classList.toggle("step-map-focus", !!siteMapWorkspaceOpen && !!siteMapOutlineWizardOpen && [2,3].includes(Number(siteMapOutlineWizardStep || 1)));
+      renderOutlineWizardProgress({ hasAddress, hasConfirm, hasOutline, drawing });
+      updateOutlineWizardActionStates({ hasAddress, hasConfirm, hasOutline, drawing });
     }
 
     function updateOutlineWizardActionStates(state) {
       const s = state || {};
       const hasAddress = !!s.hasAddress;
+      const hasConfirm = !!s.hasConfirm;
       const hasOutline = !!s.hasOutline;
       const drawing = !!s.drawing;
       const btnFind = document.getElementById("siteMapOutlineStepFindBtn");
@@ -2826,24 +2969,56 @@ HTML = """<!doctype html>
       const btnFinish = document.getElementById("siteMapOutlineFinishDrawBtn");
       const btnClear = document.getElementById("siteMapOutlineClearBtn");
       const btnUndoArea = document.getElementById("siteMapAreaUndoBtn");
+      const btnContinueZoneSetup = document.getElementById("siteMapOutlineContinueZoneSetupBtn");
+      const floorsSet = Number((siteMapConfig && siteMapConfig.building_floors) || 0) >= 1;
       if (btnFind) btnFind.classList.toggle("active", !hasAddress);
       if (btnAuto) {
-        btnAuto.disabled = !hasAddress || drawing;
-        btnAuto.classList.toggle("active", hasAddress && !hasOutline && !drawing);
+        btnAuto.disabled = !hasAddress || !hasConfirm || drawing;
+        btnAuto.classList.toggle("active", false);
       }
       if (btnStart) {
-        btnStart.disabled = !hasAddress || drawing;
-        btnStart.classList.toggle("active", hasAddress && !drawing && !hasOutline);
+        btnStart.disabled = !hasAddress || !hasConfirm || drawing;
+        btnStart.classList.toggle("active", hasAddress && hasConfirm && !drawing && !hasOutline);
       }
       if (btnFinish) {
         btnFinish.disabled = !drawing;
         btnFinish.classList.toggle("active", drawing);
       }
-      if (btnUndoOutline) btnUndoOutline.disabled = !drawing || siteMapDraftBuildingOutlinePoints.length === 0;
+      if (btnUndoOutline) {
+        const canReopenSaved = !!(siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) === 3 && siteMapConfig && siteMapConfig.building_outline);
+        btnUndoOutline.disabled = (!drawing && !canReopenSaved) || (drawing && siteMapDraftBuildingOutlinePoints.length === 0);
+      }
       if (btnClear) {
         btnClear.disabled = !hasOutline && !drawing;
       }
       if (btnUndoArea) btnUndoArea.disabled = !siteMapDrawingArea || siteMapDraftAreaPoints.length === 0;
+      if (btnContinueZoneSetup) {
+        const buildingBaseComplete = hasAddress && !!(siteMapConfig && siteMapConfig.building_confirm_pin) && hasOutline && !drawing && floorsSet;
+        btnContinueZoneSetup.style.display = buildingBaseComplete ? "" : "none";
+      }
+      if (buildingSetupComplete() && Number(siteMapOutlineWizardStep || 1) >= 5 && !drawing) {
+        if (btnFind) btnFind.classList.remove("active");
+        if (btnStart) btnStart.classList.remove("active");
+      }
+    }
+
+    function continueToZoneSetupWizard() {
+      if (!siteMapConfig || !siteMapConfig.building_outline) {
+        setSiteMapMsg("Complete the building outline first.");
+        setOutlineWizardStep(3, "Complete and confirm the building outline first.");
+        return;
+      }
+      const floorsSet = Math.max(0, Number((siteMapConfig && siteMapConfig.building_floors) || 0)) >= 1;
+      if (!floorsSet) {
+        setSiteMapMsg("Save the building floor count first.");
+        setOutlineWizardStep(4, "Next: set and save the building floor count.");
+        return;
+      }
+      setOutlineWizardStep(5, "Building setup complete. Continue with zone setup (zone colors and main boiler locations).");
+      setSiteMapMsg("Building setup complete. Opening Zone Setup.");
+      updateSiteMapWorkspaceStatus("Building setup complete");
+      if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+      setTimeout(() => openZoneSetupWorkspace(), 50);
     }
 
     function centerMapOnAddressOrDefault(preferredZoom = 18) {
@@ -2918,6 +3093,36 @@ HTML = """<!doctype html>
       return fitMapToLatLngPoints(poly, 0.16);
     }
 
+    function focusNoScroll(el, opts = {}) {
+      if (!el || typeof el.focus !== "function") return;
+      try {
+        el.focus({ preventScroll: true });
+      } catch (_e) {
+        try { el.focus(); } catch (__e) {}
+      }
+      if (opts.select && typeof el.select === "function") {
+        try { el.select(); } catch (_e) {}
+      }
+    }
+
+    function scrollSiteMapWorkspaceToCanvas(opts = {}) {
+      const canvas = document.getElementById("siteMapCanvas");
+      const card = document.getElementById("siteMapCard");
+      if (!canvas) return;
+      const behavior = opts.behavior || "smooth";
+      const pad = Number.isFinite(Number(opts.pad)) ? Number(opts.pad) : 8;
+      if (card && card.classList.contains("workspace")) {
+        try {
+          const top = Math.max(0, Number(canvas.offsetTop || 0) - pad);
+          card.scrollTo({ top, behavior });
+        } catch (_e) {
+          try { card.scrollTop = Math.max(0, Number(canvas.offsetTop || 0) - pad); } catch (__e) {}
+        }
+      } else {
+        try { canvas.scrollIntoView({ behavior, block: "start" }); } catch (_e) {}
+      }
+    }
+
     function applyOutlineWizardStepAssist(step, opts = {}) {
       if (opts && opts.skipAssist) return;
       const s = Number(step || 1);
@@ -2928,25 +3133,24 @@ HTML = """<!doctype html>
         }
         if (s === 1) {
           centerMapOnAddressOrDefault(17);
-          document.getElementById("siteAddress")?.focus();
+          focusNoScroll(document.getElementById("siteAddress"));
           return;
         }
         if (s === 2) {
-          document.getElementById("siteMapOutlineStepAutoBtn")?.focus();
+          focusNoScroll(document.getElementById("siteMapCanvas"));
           return;
         }
         if (s === 3) {
-          if (!siteMapDrawingBuildingOutline) document.getElementById("siteMapOutlineStartDrawBtn")?.focus();
-          else document.getElementById("siteMapOutlineFinishDrawBtn")?.focus();
+          if (!siteMapDrawingBuildingOutline) focusNoScroll(document.getElementById("siteMapOutlineStartDrawBtn"));
+          else focusNoScroll(document.getElementById("siteMapOutlineFinishDrawBtn"));
           return;
         }
         if (s === 4) {
-          document.getElementById("siteMapBuildingFloors")?.focus();
-          document.getElementById("siteMapBuildingFloors")?.select?.();
+          focusNoScroll(document.getElementById("siteMapBuildingFloors"), { select: true });
           return;
         }
         if (s === 5) {
-          document.getElementById("siteMapApplyParentColorsBtn")?.focus();
+          focusNoScroll(document.getElementById("siteMapApplyParentColorsBtn"));
           return;
         }
         if (s === 6) {
@@ -2958,13 +3162,13 @@ HTML = """<!doctype html>
               if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
             }
             const btnId = zid === "zone2_main" ? "siteMapSelectZone2MainBtn" : "siteMapSelectZone1MainBtn";
-            document.getElementById(btnId)?.focus();
+            focusNoScroll(document.getElementById(btnId));
           }
           return;
         }
         if (s === 7) {
           if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
-          document.getElementById("siteMapWorkspaceSaveBtn")?.focus();
+          focusNoScroll(document.getElementById("siteMapWorkspaceSaveBtn"));
         }
       }, 20);
     }
@@ -2972,6 +3176,7 @@ HTML = """<!doctype html>
     function setOutlineWizardStep(step, msg, opts = {}) {
       siteMapOutlineWizardStep = Math.max(1, Math.min(7, Number(step || 1)));
       renderOutlineWizardSteps();
+      updateSiteMapZoneMappingAvailability();
       if (msg !== undefined) setOutlineWizardMsg(msg);
       updateSiteMapWorkspaceStatus();
       applyOutlineWizardStepAssist(siteMapOutlineWizardStep, opts);
@@ -2982,6 +3187,10 @@ HTML = """<!doctype html>
       const el = document.getElementById("siteMapOutlineWizard");
       if (el) el.classList.toggle("show", siteMapOutlineWizardOpen);
       if (siteMapOutlineWizardOpen) renderOutlineWizardSteps();
+      if (siteMapOutlineWizardOpen && buildingSetupComplete() && Number(siteMapOutlineWizardStep || 1) >= 5) {
+        setOutlineWizardMsg(buildingSetupSharedCompleteMsg());
+      }
+      updateSiteMapZoneMappingAvailability();
     }
 
     function areParentColorsAppliedToZones() {
@@ -3002,8 +3211,147 @@ HTML = """<!doctype html>
       const n = Math.max(1, Number(document.getElementById("siteMapBuildingFloors")?.value || 1));
       siteMapConfig.building_floors = Math.round(n);
       if (document.getElementById("siteMapBuildingFloors")) document.getElementById("siteMapBuildingFloors").value = String(Math.round(n));
-      setOutlineWizardStep(5, `Building floor count saved: ${Math.round(n)} floor${Math.round(n) === 1 ? "" : "s"}.`);
-      setSiteMapMsg(`Building floor count set to ${Math.round(n)}.`);
+      setOutlineWizardStep(4, `Building floor count saved: ${Math.round(n)} floor${Math.round(n) === 1 ? "" : "s"}. Building setup complete. Continue to Zone Setup.`);
+      updateSiteMapZoneMappingAvailability();
+      setSiteMapMsg(`Building floor count set to ${Math.round(n)}. Building setup complete. Click Continue to Zone Setup.`);
+      updateSiteMapWorkspaceStatus("Building setup complete");
+      if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+    }
+
+    function buildingSetupComplete() {
+      const hasAddress = !!String((siteMapConfig && siteMapConfig.address) || "").trim();
+      const hasConfirm = !!(siteMapConfig && siteMapConfig.building_confirm_pin);
+      const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      const floors = Math.max(0, Number((siteMapConfig && siteMapConfig.building_floors) || 0));
+      return hasAddress && hasConfirm && hasOutline && floors >= 1;
+    }
+
+    function buildingSetupSharedCompleteMsg() {
+      return "Building setup is complete and shared for all zones/devices. Continue with zone mapping.";
+    }
+
+    function openBuildingSetupRequiredPrompt(contextLabel = "map zones") {
+      enterSiteMapWorkspace({
+        title: "Building Outline Setup",
+        hint: "Complete building outline and floors before mapping zone locations.",
+        layer: "street",
+        outlineWizard: true,
+      });
+      const hasConfirm = !!(siteMapConfig && siteMapConfig.building_confirm_pin);
+      const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      const floors = Math.max(0, Number((siteMapConfig && siteMapConfig.building_floors) || 0));
+      if (!String((siteMapConfig && siteMapConfig.address) || "").trim()) setOutlineWizardStep(1, `Complete building setup first, then you can ${contextLabel}.`);
+      else if (!hasConfirm) setOutlineWizardStep(2, `Click the building on the map to confirm it before you ${contextLabel}.`, { skipAssist: true });
+      else if (!hasOutline) setOutlineWizardStep(3, `Draw the building outline before you ${contextLabel}.`);
+      else if (floors < 1) setOutlineWizardStep(4, `Set building floors before you ${contextLabel}.`);
+      else setOutlineWizardStep(5, `Finish building setup steps, then you can ${contextLabel}.`);
+      setSiteMapMsg("Complete Building Outline Setup first.");
+      return false;
+    }
+
+    function ensureBuildingSetupReadyForZoneMapping(contextLabel = "map zones") {
+      if (buildingSetupComplete()) return true;
+      return openBuildingSetupRequiredPrompt(contextLabel);
+    }
+
+    function hasRealDownstreamZones() {
+      const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+      return realDownstreamRows(ds).length > 0;
+    }
+
+    function nextUnpinnedZoneId() {
+      const opts = siteMapZoneOptions().filter((o) => {
+        if (o.id === "zone1_main" || o.id === "zone2_main") return true;
+        const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+        const row = ds.find((z) => String(z.id || "") === String(o.id));
+        return row ? isAdoptedZone(row) : false;
+      });
+      for (const o of opts) {
+        if (!getSiteMapPin(o.id)) return o.id;
+      }
+      return "";
+    }
+
+    function openPromptToPinZone(zoneId, msg) {
+      if (!ensureBuildingSetupReadyForZoneMapping("place zone and equipment pins")) return;
+      const opts = siteMapZoneOptions();
+      const hit = opts.find((o) => o.id === zoneId);
+      const sel = document.getElementById("siteMapZoneSelect");
+      if (sel) {
+        sel.value = zoneId;
+        syncSiteMapDetailsFormFromSelected();
+      }
+      enterSiteMapWorkspace({
+        title: "Pin Zone / Device Location",
+        hint: "Click the map to place the selected zone/device pin, then Save & Finish.",
+        layer: "satellite",
+      });
+      siteMapDrawingBuildingOutline = false;
+      siteMapDraftBuildingOutlinePoints = [];
+      renderSiteMapDraftBuildingOutline();
+      if (siteMapDrawingArea) {
+        siteMapDrawingArea = false;
+        siteMapDraftAreaPoints = [];
+        renderSiteMapDraftArea();
+      }
+      if (!centerMapOnZonePin(zoneId)) {
+        if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+      }
+      updateSiteMapWorkspaceStatus();
+      if (msg) setSiteMapMsg(msg);
+      else if (hit) setSiteMapMsg(`Click the map to place ${hit.label}.`);
+    }
+
+    function confirmBuildingOutlineAndProceed(sourceLabel = "outline") {
+      if (!(siteMapConfig && siteMapConfig.building_outline)) return false;
+      centerMapOnBuildingOutline();
+      const ok = window.confirm("Does the building outline look correct?\\n\\nChoose OK to save the outline and continue.");
+      if (!ok) {
+        setOutlineWizardStep(3, `Review the ${sourceLabel} and adjust it before continuing.`, { skipAssist: true });
+        setSiteMapMsg("Building outline not confirmed yet. Adjust the outline and finish again.");
+        return false;
+      }
+      // Persist the building outline immediately so it remains the base setup geometry.
+      saveSiteMapConfig();
+      setOutlineWizardStep(4, "Building outline saved and confirmed. Next: set and save the building floor count.");
+      updateSiteMapZoneMappingAvailability();
+      setSiteMapMsg("Building outline confirmed and saved. Next: set the building floor count, then Continue to Zone Setup.");
+      centerMapOnBuildingOutline();
+      setTimeout(() => focusNoScroll(document.getElementById("siteMapBuildingFloors"), { select: true }), 40);
+      return true;
+    }
+
+    function runPostBuildingSetupPromptFlow() {
+      if (!buildingSetupComplete()) return;
+      const z1Pinned = !!getSiteMapPin("zone1_main");
+      const z2Pinned = !!getSiteMapPin("zone2_main");
+      if (!z1Pinned) {
+        if (window.confirm("Building setup is complete. Pin Zone 1 main boiler/circulator location now?")) {
+          selectMainBoilerZone("zone1_main");
+          return;
+        }
+      }
+      if (!z2Pinned) {
+        if (window.confirm("Pin Zone 2 main boiler/circulator location now?")) {
+          selectMainBoilerZone("zone2_main");
+          return;
+        }
+      }
+      const hasDownstream = hasRealDownstreamZones();
+      if (!hasDownstream) {
+        if (window.confirm("No additional zone devices are detected yet. Do you want to set up a new device now?")) {
+          openSetupPanel();
+        }
+        return;
+      }
+      const unpinned = nextUnpinnedZoneId();
+      if (unpinned && !isMainZoneId(unpinned)) {
+        const label = (siteMapZoneOptions().find((o) => o.id === unpinned) || {}).label || "next zone";
+        if (window.confirm(`Building setup is complete. Do you want to place a pin for ${label} now?`)) {
+          openPromptToPinZone(unpinned, `Click the map to place ${label}.`);
+          return;
+        }
+      }
     }
 
     function applyParentColorsToZones() {
@@ -3024,6 +3372,14 @@ HTML = """<!doctype html>
     }
 
     function selectMainBoilerZone(zoneId, opts = {}) {
+      if (!ensureBuildingSetupReadyForZoneMapping("pin main boiler locations")) return;
+      if (!siteMapOutlineWizardOpen) setSiteMapSetupMode("zone-main");
+      siteMapDrawingBuildingOutline = false;
+      siteMapDraftBuildingOutlinePoints = [];
+      renderSiteMapDraftBuildingOutline();
+      siteMapDrawingArea = false;
+      siteMapDraftAreaPoints = [];
+      renderSiteMapDraftArea();
       const sel = document.getElementById("siteMapZoneSelect");
       if (sel) {
         sel.value = zoneId;
@@ -3031,7 +3387,7 @@ HTML = """<!doctype html>
       }
       enterSiteMapWorkspace({
         title: "Main Boiler Location",
-        hint: `Place or verify the ${zoneId === "zone1_main" ? "Zone 1" : "Zone 2"} main boiler/circulator location, then Save & Finish.`,
+        hint: `Pin only: place or verify the ${zoneId === "zone1_main" ? "Zone 1" : "Zone 2"} main boiler/circulator location, set floor in popup, then Save & Finish.`,
         layer: "satellite",
         outlineWizard: true,
       });
@@ -3041,17 +3397,51 @@ HTML = """<!doctype html>
       }
       setOutlineWizardStep(
         6,
-        `${zoneId === "zone1_main" ? "Zone 1" : "Zone 2"} main selected. Click the map to place or update the main boiler location pin.`,
+        `${zoneId === "zone1_main" ? "Zone 1" : "Zone 2"} main selected. Click the map once to place or update the main boiler pin, then set its floor in the popup.`,
         { skipAssist: !!opts.preserveStep }
       );
       updateSiteMapWorkspaceStatus();
+      setSiteMapMsg(`${zoneId === "zone1_main" ? "Zone 1" : "Zone 2"} main boiler mode: pin placement only (not a building outline or zone area).`);
     }
 
     function advanceOutlineWizardStep() {
       if (!siteMapOutlineWizardOpen) return;
       const cur = Number(siteMapOutlineWizardStep || 1);
+      const hasAddress = !!String((siteMapConfig && siteMapConfig.address) || "").trim();
+      const hasConfirm = !!(siteMapConfig && siteMapConfig.building_confirm_pin);
+      const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      const floorsSet = Math.max(0, Number((siteMapConfig && siteMapConfig.building_floors) || 0)) >= 1;
+      if (cur === 1 && !hasAddress) {
+        setOutlineWizardMsg("Find the building address first, then press Enter to continue.");
+        setSiteMapMsg("Find Address first.");
+        return;
+      }
+      if (cur === 2 && !hasConfirm) {
+        setOutlineWizardMsg("Click the building on the map to confirm the correct structure, then press Enter.");
+        setSiteMapMsg("Click the building on the map to confirm it.");
+        return;
+      }
+      if (cur === 3 && !hasOutline) {
+        setOutlineWizardMsg("Draw the building outline (or use Auto Detect) before continuing.");
+        setSiteMapMsg("Complete the building outline first.");
+        return;
+      }
+      if (cur === 4 && !floorsSet) {
+        setOutlineWizardMsg("Set and save the building floor count before continuing.");
+        setSiteMapMsg("Save the building floor count first.");
+        return;
+      }
       const next = Math.min(7, cur + 1);
       setOutlineWizardStep(next);
+    }
+
+    function goToPreviousOutlineWizardStep() {
+      if (!siteMapOutlineWizardOpen) return;
+      const cur = Math.max(1, Number(siteMapOutlineWizardStep || 1));
+      if (cur <= 1) return;
+      const prev = cur - 1;
+      setOutlineWizardStep(prev, `Returned to Step ${prev}.`);
+      setSiteMapMsg(`Returned to Step ${prev}.`);
     }
 
     function updateSiteMapWorkspaceStatus(extraText = "") {
@@ -3069,16 +3459,63 @@ HTML = """<!doctype html>
       updateSiteMapDrawHint();
     }
 
+    function renderSiteMapZoneWizard() {
+      const wiz = document.getElementById("siteMapZoneWizard");
+      const status = document.getElementById("siteMapZoneWizardStatus");
+      const mainActions = document.getElementById("siteMapZoneWizardMainActions");
+      const dsActions = document.getElementById("siteMapZoneWizardDownstreamActions");
+      const mainTab = document.getElementById("siteMapZoneWizardMainTabBtn");
+      const dsTab = document.getElementById("siteMapZoneWizardDownstreamTabBtn");
+      if (!wiz) return;
+      const isMain = siteMapSetupMode === "zone-main";
+      const isDownstream = siteMapSetupMode === "zone-downstream";
+      wiz.classList.toggle("show", isMain || isDownstream);
+      if (mainActions) mainActions.classList.toggle("hidden", !isMain);
+      if (dsActions) dsActions.classList.toggle("hidden", !isDownstream);
+      if (mainTab) mainTab.classList.toggle("active", isMain);
+      if (dsTab) dsTab.classList.toggle("active", isDownstream);
+      if (status) {
+        if (isMain) {
+          status.textContent = "Main Zone Wizard: Place the main boiler/circulator pin(s) for Zone 1 and Zone 2 inside the building outline. Set floor in the map popup after each pin.";
+        } else if (isDownstream) {
+          status.textContent = "Downstream Zone Wizard: Select an adopted zone/device, place its pin inside the building outline, then draw an optional served area.";
+        } else {
+          status.textContent = "";
+        }
+      }
+    }
+
+    function setSiteMapSetupMode(mode) {
+      siteMapSetupMode = String(mode || "none");
+      const card = document.getElementById("siteMapCard");
+      if (card) {
+        card.classList.toggle("building-setup-mode", siteMapSetupMode === "building");
+        card.classList.toggle("zone-setup-mode", siteMapSetupMode === "zone-main" || siteMapSetupMode === "zone-downstream");
+      }
+      renderSiteMapZoneWizard();
+    }
+
+    function exitZoneSetupMode() {
+      setSiteMapSetupMode("none");
+      exitSiteMapWorkspace();
+      setSiteMapMsg("Exited Zone Setup mode.");
+    }
+
     function updateSiteMapDrawHint() {
       const el = document.getElementById("siteMapDrawHint");
       if (!el) return;
       let text = "";
       if (siteMapDrawingBuildingOutline) {
         const n = Number(siteMapDraftBuildingOutlinePoints.length || 0);
-        text = `Drawing Building Outline: Click to add points • Double-click to finish • Undo Last Point${n ? ` • ${n} point${n === 1 ? "" : "s"}` : ""}`;
+        text = `Drawing Building Outline: Click to add points • Use Finish Manual Outline button • Undo Last Point${n ? ` • ${n} point${n === 1 ? "" : "s"}` : ""}`;
       } else if (siteMapDrawingArea) {
         const n = Number(siteMapDraftAreaPoints.length || 0);
-        text = `Drawing Zone Area: Click to add points • Double-click to finish • Undo Last Area Point${n ? ` • ${n} point${n === 1 ? "" : "s"}` : ""}`;
+        text = `Drawing Zone Area: Click to add points • Use Finish Area button • Undo Last Area Point${n ? ` • ${n} point${n === 1 ? "" : "s"}` : ""}`;
+      } else if (siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) === 6) {
+        const zid = selectedSiteMapZoneId();
+        if (zid === "zone1_main" || zid === "zone2_main") {
+          text = `Main Boiler Pin Mode: Click map once to place pin • Set floor in popup • Save & Finish`;
+        }
       }
       if (text) {
         el.textContent = text;
@@ -3089,14 +3526,29 @@ HTML = """<!doctype html>
       }
     }
 
-    function openSiteMapPanel() {
+    function openSiteMapPanel(opts = {}) {
       ensureAdminToolsOpen();
       setAdminTab("map");
       scrollToAdminPanel("adminMapPanel");
+      setTimeout(() => {
+        if (opts && opts.suppressAutoBuildingPrompt) return;
+        if (siteMapOutlineWizardOpen) return;
+        if (!buildingSetupComplete()) {
+          openBuildingSetupRequiredPrompt("map zone locations");
+        }
+      }, 120);
     }
 
     function enterSiteMapWorkspace(opts = {}) {
-      openSiteMapPanel();
+      if (!siteMapWorkspaceOpen) {
+        const mapPanel = document.getElementById("adminMapPanel");
+        if (mapPanel && !mapPanel.classList.contains("hidden")) {
+          ensureAdminToolsOpen();
+          setAdminTab("map");
+        } else {
+          openSiteMapPanel({ suppressAutoBuildingPrompt: true });
+        }
+      }
       siteMapWorkspaceOpen = true;
       const card = document.getElementById("siteMapCard");
       const bar = document.getElementById("siteMapWorkspaceBar");
@@ -3109,16 +3561,17 @@ HTML = """<!doctype html>
       if (opts.layer) setSiteMapBaseLayer(opts.layer);
       setTimeout(() => {
         if (siteMapMap) siteMapMap.invalidateSize();
-        const canvas = document.getElementById("siteMapCanvas");
-        if (canvas) canvas.scrollIntoView({ behavior: "smooth", block: "center" });
+        scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: (opts.outlineWizard ? 8 : 40) });
       }, 80);
     }
 
     function exitSiteMapWorkspace() {
       siteMapWorkspaceOpen = false;
+      setSiteMapSetupMode("none");
       const card = document.getElementById("siteMapCard");
       const bar = document.getElementById("siteMapWorkspaceBar");
       if (card) card.classList.remove("workspace");
+      if (card) card.classList.remove("step-map-focus");
       if (bar) bar.classList.remove("show");
       document.body.classList.remove("map-workspace-open");
       if (siteMapDrawingArea) {
@@ -3137,10 +3590,14 @@ HTML = """<!doctype html>
     }
 
     async function saveAndFinishSiteMapWorkspace() {
+      const wasOutlineWizard = !!siteMapOutlineWizardOpen;
       if (siteMapOutlineWizardOpen) setOutlineWizardStep(7, "Saving map changes and finishing setup...");
       await saveSiteMapConfig();
       exitSiteMapWorkspace();
       setSiteMapMsg("Map changes saved.");
+      if (buildingSetupComplete()) {
+        setTimeout(runPostBuildingSetupPromptFlow, 150);
+      }
     }
 
     function commissioningZoneOptions() {
@@ -3859,6 +4316,39 @@ HTML = """<!doctype html>
       const floorsEl = document.getElementById("siteMapBuildingFloors");
       if (floorsEl) floorsEl.value = String(Math.max(1, Number(siteMapConfig.building_floors || 1)));
       syncSiteMapDetailsFormFromSelected();
+      updateSiteMapZoneMappingAvailability();
+    }
+
+    function updateSiteMapZoneMappingAvailability() {
+      const ready = buildingSetupComplete();
+      const wrap = document.getElementById("siteMapZoneMappingSection");
+      const lockNote = document.getElementById("siteMapZoneMappingLockedNote");
+      const zoneWrap = document.getElementById("siteMapZoneSelectWrap");
+      if (wrap) wrap.classList.toggle("hidden", !ready);
+      if (zoneWrap) zoneWrap.classList.toggle("hidden", !ready);
+      if (lockNote) lockNote.style.display = ready ? "none" : "block";
+
+      const zoneIds = [
+        "siteMapZoneSelect", "siteMapClearPinBtn", "siteMapStartAreaBtn", "siteMapFinishAreaBtn",
+        "siteMapCancelAreaBtn", "siteMapClearAreaBtn", "siteMapAreaUndoBtn", "siteMapPinColor",
+        "siteMapEquipType", "siteMapRoomArea", "siteMapThermostatLoc", "siteMapValveType",
+        "siteMapPumpModel", "siteMapPumpVoltage", "siteMapDesc", "siteMapAccessInstructions",
+        "siteMapPumpSpeedMode", "siteMapPumpSerial", "siteMapBreakerRef", "siteMapInstalledBy",
+        "siteMapInstallDate", "siteMapLastServiceDate", "siteMapPumpServiceNotes", "siteMapPhotoInput",
+        "siteMapClearPhotoBtn", "siteMapApplyDetailsBtn"
+      ];
+      zoneIds.forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        if ("disabled" in el) el.disabled = !ready;
+      });
+
+      if (!ready && siteMapDrawingArea) {
+        siteMapDrawingArea = false;
+        siteMapDraftAreaPoints = [];
+        renderSiteMapDraftArea();
+      }
+      updateSiteMapWorkspaceStatus();
     }
 
     function selectedSiteMapZoneId() {
@@ -3918,7 +4408,7 @@ HTML = """<!doctype html>
       if (!bo || typeof bo !== "object") return;
       try {
         siteMapBuildingOutlineLayer = L.geoJSON(bo, {
-          style: { color: "#0f172a", weight: 2, fillColor: "#94a3b8", fillOpacity: 0.08 }
+          style: { color: "#0f172a", weight: 4, opacity: 0.95, fillColor: "#94a3b8", fillOpacity: 0.06 }
         }).addTo(siteMapMap);
       } catch (e) {
         siteMapBuildingOutlineLayer = null;
@@ -3931,11 +4421,149 @@ HTML = """<!doctype html>
         try { siteMapMap.removeLayer(siteMapDraftBuildingOutlineLayer); } catch (e) {}
         siteMapDraftBuildingOutlineLayer = null;
       }
+      if (siteMapDraftBuildingOutlinePointsLayer) {
+        try { siteMapMap.removeLayer(siteMapDraftBuildingOutlinePointsLayer); } catch (e) {}
+        siteMapDraftBuildingOutlinePointsLayer = null;
+      }
       if (!siteMapDrawingBuildingOutline || siteMapDraftBuildingOutlinePoints.length === 0) return;
       const latlngs = siteMapDraftBuildingOutlinePoints.map((p) => [p.lat, p.lng]);
       const style = { color: "#0f172a", weight: 2, dashArray: "8,5", fillColor: "#94a3b8", fillOpacity: 0.08 };
       if (latlngs.length >= 3) siteMapDraftBuildingOutlineLayer = L.polygon(latlngs, style).addTo(siteMapMap);
       else siteMapDraftBuildingOutlineLayer = L.polyline(latlngs, style).addTo(siteMapMap);
+      const markers = siteMapDraftBuildingOutlinePoints.map((p, idx) =>
+        L.circleMarker([Number(p.lat), Number(p.lng)], {
+          radius: idx === 0 ? 5 : 4,
+          color: "#0f172a",
+          weight: 2,
+          fillColor: idx === 0 ? "#f59e0b" : "#ffffff",
+          fillOpacity: 0.95,
+        })
+      );
+      siteMapDraftBuildingOutlinePointsLayer = L.layerGroup(markers).addTo(siteMapMap);
+    }
+
+    function buildingOutlineDraftPointsFromSaved() {
+      const bo = siteMapConfig && siteMapConfig.building_outline;
+      if (!bo || typeof bo !== "object" || String(bo.type) !== "Polygon") return [];
+      const rings = Array.isArray(bo.coordinates) ? bo.coordinates : [];
+      const ring = Array.isArray(rings[0]) ? rings[0] : [];
+      const pts = ring
+        .map((c) => (Array.isArray(c) && c.length >= 2 ? { lat: Number(c[1]), lng: Number(c[0]) } : null))
+        .filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+      if (pts.length >= 2) {
+        const a = pts[0];
+        const b = pts[pts.length - 1];
+        if (a && b && a.lat === b.lat && a.lng === b.lng) pts.pop();
+      }
+      return pts;
+    }
+
+    function buildingOutlineRingLatLngs() {
+      const bo = siteMapConfig && siteMapConfig.building_outline;
+      if (!bo || typeof bo !== "object" || String(bo.type) !== "Polygon") return [];
+      const rings = Array.isArray(bo.coordinates) ? bo.coordinates : [];
+      const ring = Array.isArray(rings[0]) ? rings[0] : [];
+      return ring
+        .map((c) => (Array.isArray(c) && c.length >= 2 ? { lat: Number(c[1]), lng: Number(c[0]) } : null))
+        .filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    }
+
+    function pointInPolygonLatLng(pt, ring) {
+      if (!pt || !Number.isFinite(Number(pt.lat)) || !Number.isFinite(Number(pt.lng))) return false;
+      const poly = Array.isArray(ring) ? ring.filter((p) => p && Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng))) : [];
+      if (poly.length < 3) return false;
+      let inside = false;
+      const x = Number(pt.lng), y = Number(pt.lat);
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = Number(poly[i].lng), yi = Number(poly[i].lat);
+        const xj = Number(poly[j].lng), yj = Number(poly[j].lat);
+        const intersects = ((yi > y) !== (yj > y)) && (x < ((xj - xi) * (y - yi)) / ((yj - yi) || 1e-12) + xi);
+        if (intersects) inside = !inside;
+      }
+      return inside;
+    }
+
+    function isPointInsideSavedBuildingOutline(latlng) {
+      const ring = buildingOutlineRingLatLngs();
+      if (ring.length < 3) return true; // no saved outline yet; caller may separately gate this
+      return pointInPolygonLatLng(latlng, ring);
+    }
+
+    function openZoneSetupWorkspace(mode = "zone-main") {
+      if (!ensureBuildingSetupReadyForZoneMapping("set up zone and equipment locations")) return;
+      setSiteMapSetupMode(mode === "zone-downstream" ? "zone-downstream" : "zone-main");
+      enterSiteMapWorkspace({
+        title: "Zone Setup",
+        hint: "Building outline is locked. Select a zone/device, then click inside the building outline to place pins or draw served areas.",
+        layer: "satellite",
+      });
+      showOutlineWizard(false);
+      const sel = document.getElementById("siteMapZoneSelect");
+      if (siteMapSetupMode === "zone-main") {
+        if (sel && !["zone1_main", "zone2_main"].includes(String(sel.value || ""))) sel.value = "zone1_main";
+      } else if (siteMapSetupMode === "zone-downstream") {
+        const ds = realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []);
+        if (sel && ds.length && !ds.some((z) => String(z.id) === String(sel.value || ""))) sel.value = String(ds[0].id);
+      }
+      if (!selectedSiteMapZoneId() && sel) sel.value = "zone1_main";
+      syncSiteMapDetailsFormFromSelected();
+      if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+      renderSiteMapZoneWizard();
+      updateSiteMapWorkspaceStatus(siteMapSetupMode === "zone-downstream" ? "Downstream zone setup mode" : "Main zone setup mode");
+      setSiteMapMsg(siteMapSetupMode === "zone-downstream"
+        ? "Downstream Zone Setup: place downstream zone pins/areas inside the saved building outline."
+        : "Main Zone Setup: place Zone 1/Zone 2 main boiler pins inside the saved building outline.");
+    }
+
+    function openMainBoilerFloorPopup(zoneId) {
+      if (!isMainZoneId(zoneId)) return;
+      const marker = siteMapMarkers[zoneId];
+      if (!marker || !window.L) return;
+      const pin = getSiteMapPin(zoneId) || {};
+      const floors = Math.max(1, Number((siteMapConfig && siteMapConfig.building_floors) || 1));
+      const selected = String(pin.main_boiler_floor || "");
+      const opts = ['<option value="">Select floor</option>'];
+      for (let i = 1; i <= floors; i++) {
+        opts.push(`<option value="${i}"${String(i) === selected ? " selected" : ""}>Floor ${i}</option>`);
+      }
+      const zoneLabel = zoneId === "zone1_main" ? "Zone 1 Main Boiler" : "Zone 2 Main Boiler";
+      marker.bindPopup(
+        `<div style="min-width:220px">` +
+        `<div style="font-weight:600;margin-bottom:6px">${zoneLabel}</div>` +
+        `<div class="smallnote" style="margin-bottom:6px">Set the floor for this main boiler/circulator pin.</div>` +
+        `<label class="label" style="display:block;margin-bottom:4px">Main Boiler Floor</label>` +
+        `<select id="siteMapMainBoilerFloorPopupSelect" class="select" style="width:100%;margin-bottom:8px">${opts.join("")}</select>` +
+        `<div style="display:flex;gap:8px;justify-content:flex-end">` +
+        `<button type="button" class="btn" id="siteMapMainBoilerFloorPopupCancelBtn">Cancel</button>` +
+        `<button type="button" class="btn btn-primary" id="siteMapMainBoilerFloorPopupSaveBtn">Save Floor</button>` +
+        `</div>` +
+        `</div>`
+      );
+      siteMapMainBoilerFloorPopupZoneId = zoneId;
+      marker.openPopup();
+      setTimeout(() => {
+        const sel = document.getElementById("siteMapMainBoilerFloorPopupSelect");
+        const saveBtn = document.getElementById("siteMapMainBoilerFloorPopupSaveBtn");
+        const cancelBtn = document.getElementById("siteMapMainBoilerFloorPopupCancelBtn");
+        if (sel) {
+          try { sel.focus({ preventScroll: true }); } catch (_e) { try { sel.focus(); } catch (_e2) {} }
+        }
+        if (cancelBtn) cancelBtn.onclick = () => { try { marker.closePopup(); } catch (_e) {} };
+        if (saveBtn) {
+          saveBtn.onclick = () => {
+            if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+            if (!siteMapConfig.pins || typeof siteMapConfig.pins !== "object") siteMapConfig.pins = {};
+            const existing = siteMapConfig.pins[zoneId] || getSiteMapPin(zoneId) || {};
+            const value = String(sel?.value || "").trim();
+            existing.main_boiler_floor = value;
+            existing.updated_utc = new Date().toISOString();
+            siteMapConfig.pins[zoneId] = existing;
+            renderSiteMapMarkers();
+            syncSiteMapDetailsFormFromSelected();
+            setSiteMapMsg(value ? `${zoneLabel} floor set to Floor ${value}. Click Save & Finish to store.` : `${zoneLabel} floor cleared. Click Save & Finish to store.`);
+          };
+        }
+      }, 40);
     }
 
     function setSiteMapPhotoPreview(dataUrl) {
@@ -4011,7 +4639,8 @@ HTML = """<!doctype html>
       entries.forEach(([zid, p]) => {
         const row = document.createElement("div");
         row.className = "pin-chip";
-        row.innerHTML = `<div class="t"><span class="pin-dot" style="background:${pinColorHex(p.color)}"></span>${labels[zid] || p.label || zid}</div><div class="s">${Number(p.lat).toFixed(5)}, ${Number(p.lng).toFixed(5)}${p.room_area_name ? ` · ${p.room_area_name}` : ""}${p.equipment_type ? ` · ${p.equipment_type}` : ""}</div>`;
+        const floorText = (isMainZoneId(zid) && p.main_boiler_floor) ? ` · Floor ${String(p.main_boiler_floor)}` : "";
+        row.innerHTML = `<div class="t"><span class="pin-dot" style="background:${pinColorHex(p.color)}"></span>${labels[zid] || p.label || zid}</div><div class="s">${Number(p.lat).toFixed(5)}, ${Number(p.lng).toFixed(5)}${floorText}${p.room_area_name ? ` · ${p.room_area_name}` : ""}${p.equipment_type ? ` · ${p.equipment_type}` : ""}</div>`;
         el.appendChild(row);
       });
     }
@@ -4062,6 +4691,26 @@ HTML = """<!doctype html>
       }
     }
 
+    function renderSiteMapBuildingConfirmPin() {
+      if (!siteMapMap || !window.L) return;
+      if (siteMapBuildingConfirmMarker) {
+        try { siteMapMap.removeLayer(siteMapBuildingConfirmMarker); } catch (e) {}
+        siteMapBuildingConfirmMarker = null;
+      }
+      const p = siteMapConfig && siteMapConfig.building_confirm_pin;
+      if (!p || typeof p !== "object") return;
+      const lat = Number(p.lat), lng = Number(p.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      siteMapBuildingConfirmMarker = L.circleMarker([lat, lng], {
+        radius: 10,
+        color: "#0f172a",
+        weight: 2,
+        fillColor: "#f59e0b",
+        fillOpacity: 0.85,
+      }).addTo(siteMapMap);
+      siteMapBuildingConfirmMarker.bindPopup("<b>Confirmed Building</b><br>Address confirmation pin");
+    }
+
     function renderSiteMapMarkers() {
       if (!siteMapMap || !window.L) return;
       Object.values(siteMapMarkers).forEach((m) => { try { siteMapMap.removeLayer(m); } catch (e) {} });
@@ -4070,17 +4719,20 @@ HTML = """<!doctype html>
       const labels = {};
       siteMapZoneOptions().forEach((o) => { labels[o.id] = o.label; });
       Object.entries(pins).forEach(([zid, p]) => {
+        const isMain = isMainZoneId(zid);
         const marker = L.circleMarker([Number(p.lat), Number(p.lng)], {
-          radius: 8,
-          color: pinColorHex(p.color),
-          weight: 2,
+          radius: isMain ? 10 : 8,
+          color: isMain ? "#111827" : pinColorHex(p.color),
+          weight: isMain ? 3 : 2,
           fillColor: pinColorHex(p.color),
-          fillOpacity: 0.85,
+          fillOpacity: isMain ? 0.95 : 0.85,
         }).addTo(siteMapMap);
-        marker.bindPopup(`<b>${labels[zid] || p.label || zid}</b>${p.equipment_type ? `<br>${p.equipment_type}` : ""}`);
+        const mainFloorLine = (isMainZoneId(zid) && p.main_boiler_floor) ? `<br>Main Boiler Floor: ${String(p.main_boiler_floor)}` : "";
+        marker.bindPopup(`<b>${labels[zid] || p.label || zid}</b>${p.equipment_type ? `<br>${p.equipment_type}` : ""}${mainFloorLine}`);
         siteMapMarkers[zid] = marker;
       });
       renderSiteMapBuildingOutline();
+      renderSiteMapBuildingConfirmPin();
       renderSiteMapDraftBuildingOutline();
       renderSiteMapZoneAreas();
       renderSiteMapDraftArea();
@@ -4114,24 +4766,65 @@ HTML = """<!doctype html>
       });
       setSiteMapBaseLayer((base && base.map_layer) || "street");
       siteMapMap.on("click", (e) => {
+        if (
+          siteMapOutlineWizardOpen &&
+          Number(siteMapOutlineWizardStep || 1) === 3 &&
+          !siteMapDrawingBuildingOutline &&
+          !siteMapDrawingArea &&
+          !(siteMapConfig && siteMapConfig.building_outline)
+        ) {
+          siteMapDrawingArea = false;
+          siteMapDraftAreaPoints = [];
+          renderSiteMapDraftArea();
+          siteMapDrawingBuildingOutline = true;
+          siteMapDraftBuildingOutlinePoints = [];
+          setSiteMapBaseLayer("satellite");
+          renderSiteMapDraftBuildingOutline();
+          updateSiteMapWorkspaceStatus("Outline tracing started");
+          setSiteMapMsg("Outline tracing started. Click around the building corners to place outline points.");
+        }
         if (siteMapDrawingBuildingOutline) {
           siteMapDraftBuildingOutlinePoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
           renderSiteMapDraftBuildingOutline();
           fitMapToLatLngPoints(siteMapDraftBuildingOutlinePoints, 0.18);
           updateSiteMapWorkspaceStatus();
-          setOutlineWizardStep(3, `Manual outline point ${siteMapDraftBuildingOutlinePoints.length} added. Add at least 3 points, then click Finish Manual Outline.`);
+          setOutlineWizardStep(3, `Manual outline point ${siteMapDraftBuildingOutlinePoints.length} added. Add at least 3 points, then click Finish Manual Outline.`, { skipAssist: true });
           setSiteMapMsg(`Building outline point ${siteMapDraftBuildingOutlinePoints.length} added. Finish Manual Outline when complete.`);
+          return;
+        }
+        if (
+          siteMapOutlineWizardOpen &&
+          Number(siteMapOutlineWizardStep || 1) <= 2 &&
+          !siteMapDrawingArea &&
+          !siteMapDrawingBuildingOutline &&
+          String((siteMapConfig && siteMapConfig.address) || "").trim()
+        ) {
+          if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+          siteMapConfig.building_confirm_pin = { lat: Number(e.latlng.lat), lng: Number(e.latlng.lng) };
+          renderSiteMapMarkers();
+          setOutlineWizardStep(3, "Building confirmed. Next: auto detect the outline or start drawing the building boundary.", { skipAssist: true });
+          updateSiteMapWorkspaceStatus("Building confirmed");
+          setSiteMapMsg("Building confirmed. Start the outline step next.");
           return;
         }
         const sel = document.getElementById("siteMapZoneSelect");
         const zoneId = sel ? sel.value : "";
         if (!zoneId) { setSiteMapMsg("Select a zone/device first."); return; }
         if (siteMapDrawingArea) {
+          if (!isPointInsideSavedBuildingOutline(e.latlng)) {
+            setSiteMapMsg("Zone area points must be inside the saved building outline.");
+            return;
+          }
           siteMapDraftAreaPoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
           renderSiteMapDraftArea();
           fitMapToLatLngPoints(siteMapDraftAreaPoints, 0.2);
           updateSiteMapWorkspaceStatus();
           setSiteMapMsg(`Zone area point ${siteMapDraftAreaPoints.length} added. Add at least 3 points, then click Finish Area.`);
+          return;
+        }
+        if (!ensureBuildingSetupReadyForZoneMapping("place zone and equipment pins")) return;
+        if (!isPointInsideSavedBuildingOutline(e.latlng)) {
+          setSiteMapMsg("Pins must be placed inside the saved building outline.");
           return;
         }
         if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
@@ -4156,6 +4849,7 @@ HTML = """<!doctype html>
           pump_speed_mode: (getSiteMapPin(zoneId) || {}).pump_speed_mode || "",
           pump_serial: (getSiteMapPin(zoneId) || {}).pump_serial || "",
           pump_service_notes: (getSiteMapPin(zoneId) || {}).pump_service_notes || "",
+          main_boiler_floor: (getSiteMapPin(zoneId) || {}).main_boiler_floor || "",
           circuit_breaker_ref: (getSiteMapPin(zoneId) || {}).circuit_breaker_ref || "",
           description: (getSiteMapPin(zoneId) || {}).description || "",
           photo_data_url: (getSiteMapPin(zoneId) || {}).photo_data_url || "",
@@ -4164,7 +4858,12 @@ HTML = """<!doctype html>
         };
         snapshotSiteMapViewport();
         renderSiteMapMarkers();
-        setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Click Save Map to store.`);
+        if (isMainZoneId(zoneId)) {
+          openMainBoilerFloorPopup(zoneId);
+          setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Set the floor in the map popup, then click Save & Finish.`);
+        } else {
+          setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Click Save Map to store.`);
+        }
       });
       siteMapMap.on("dblclick", (e) => {
         if (siteMapDrawingBuildingOutline) {
@@ -4206,6 +4905,7 @@ HTML = """<!doctype html>
           siteMapMap.setView([Number(siteMapConfig.center.lat), Number(siteMapConfig.center.lng)], Number(siteMapConfig.zoom || 16));
           renderSiteMapMarkers();
         }
+        updateSiteMapZoneMappingAvailability();
       } catch (e) {
         setSiteMapMsg("Failed to load site map.");
       }
@@ -4228,6 +4928,7 @@ HTML = """<!doctype html>
         siteMapConfig = data;
         applySiteMapStateToForm();
         renderSiteMapMarkers();
+        updateSiteMapZoneMappingAvailability();
         setSiteMapMsg("Map saved.");
       } catch (e) {
         setSiteMapMsg("Save failed: " + e.message);
@@ -4236,11 +4937,12 @@ HTML = """<!doctype html>
 
     async function geocodeSiteAddress() {
       enterSiteMapWorkspace({
-        title: "Find Address on Map",
-        hint: "Review the location, then place pins or zone areas and click Save & Finish.",
+        title: "Building Setup - Find Address",
+        hint: "Step 1: Find the building address. Then click the map to confirm the building.",
         layer: "street",
+        outlineWizard: true,
       });
-      if (siteMapOutlineWizardOpen) setOutlineWizardStep(1, "Finding address and centering the map...");
+      setOutlineWizardStep(1, "Finding address and centering the map...", { skipAssist: true });
       const q = document.getElementById("siteAddress").value.trim();
       if (!q) { setSiteMapMsg("Enter a building address first."); return; }
       setSiteMapMsg("Finding address...");
@@ -4253,11 +4955,20 @@ HTML = """<!doctype html>
         siteMapConfig.address = q;
         siteMapConfig.center = { lat: Number(hit.lat), lng: Number(hit.lng) };
         siteMapConfig.zoom = Math.max(16, Number(siteMapConfig.zoom || 16));
+        siteMapConfig.building_confirm_pin = null;
         applySiteMapStateToForm();
         ensureSiteMapReady();
         if (siteMapMap) siteMapMap.setView([siteMapConfig.center.lat, siteMapConfig.center.lng], Number(siteMapConfig.zoom || 16));
-        if (siteMapOutlineWizardOpen) setOutlineWizardStep(2, "Address found. Try Auto Detect Outline, or draw the outline manually.");
-        setSiteMapMsg("Address found. Click the map to place a zone/device pin.");
+        renderSiteMapMarkers();
+        setOutlineWizardStep(2, "Address found. Step 2: click the building on the map to confirm the correct structure.", { skipAssist: true });
+        setTimeout(() => {
+          if (!siteMapMap) return;
+          try { siteMapMap.invalidateSize(); } catch (_e) {}
+          scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
+          const canvas = document.getElementById("siteMapCanvas");
+          if (canvas) focusNoScroll(canvas);
+        }, 60);
+        setSiteMapMsg("Address found. Next: click the building on the map to confirm it, then trace the outline.");
       } catch (e) {
         setSiteMapMsg("Address lookup failed: " + e.message);
       }
@@ -4270,7 +4981,7 @@ HTML = """<!doctype html>
         layer: "street",
         outlineWizard: true,
       });
-      setOutlineWizardStep(2, "Trying to auto-detect the building outline from map data...");
+      setOutlineWizardStep(3, "Trying to auto-detect the building outline from map data...");
       const q = document.getElementById("siteAddress").value.trim();
       if (!q) { setSiteMapMsg("Enter a building address first."); return; }
       setSiteMapMsg("Loading building outline...");
@@ -4285,8 +4996,10 @@ HTML = """<!doctype html>
           if (siteMapMap) siteMapMap.setView([siteMapConfig.center.lat, siteMapConfig.center.lng], Math.max(18, Number(siteMapConfig.zoom || 18)));
         }
         renderSiteMapMarkers();
-        setOutlineWizardStep(4, "Building outline loaded. Next: set the building floor count.");
-        setSiteMapMsg("Building outline loaded. Click Save Map to store it.");
+        centerMapOnBuildingOutline();
+        setOutlineWizardStep(3, "Building outline loaded. Review it on the map, then confirm to continue.");
+        setSiteMapMsg("Building outline loaded. Review it on the map.");
+        confirmBuildingOutlineAndProceed("auto-detected outline");
       } catch (e) {
         setOutlineWizardStep(3, "Auto-detect did not return an outline. Use Start Manual Outline to draw the building boundary.");
         setSiteMapMsg("Building outline lookup failed: " + e.message);
@@ -4294,13 +5007,37 @@ HTML = """<!doctype html>
     }
 
     function openBuildingOutlineWizard() {
+      ensureSiteMapReady();
+      setSiteMapSetupMode("building");
       enterSiteMapWorkspace({
         title: "Building Outline Setup",
         hint: "Follow the steps to define the building boundary, then Save & Finish.",
         layer: "street",
         outlineWizard: true,
       });
-      setOutlineWizardStep(1, "Step 1: Find the building address and center the map. Press Enter to move to the next step.");
+      setOutlineWizardStep(1, "Step 1: Find the building address, then click the map to confirm the building. Press Enter to continue.");
+      setTimeout(() => {
+        if (!siteMapMap) return;
+        if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+        try { siteMapMap.invalidateSize(); } catch (_e) {}
+        const canvas = document.getElementById("siteMapCanvas");
+        if (canvas) {
+          scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
+          focusNoScroll(canvas);
+        }
+      }, 120);
+    }
+
+    function exitBuildingSetupMode() {
+      if (siteMapDrawingBuildingOutline) {
+        siteMapDrawingBuildingOutline = false;
+        siteMapDraftBuildingOutlinePoints = [];
+        renderSiteMapDraftBuildingOutline();
+      }
+      showOutlineWizard(false);
+      setSiteMapSetupMode("none");
+      exitSiteMapWorkspace();
+      setSiteMapMsg("Exited Building Setup mode.");
     }
 
     function startBuildingOutlineDraw() {
@@ -4338,15 +5075,28 @@ HTML = """<!doctype html>
       siteMapDraftBuildingOutlinePoints = [];
       renderSiteMapMarkers();
       centerMapOnBuildingOutline();
-      setOutlineWizardStep(4, "Manual building outline saved. Next: set the building floor count.");
       updateSiteMapWorkspaceStatus();
-      setSiteMapMsg("Manual building outline saved. Click Save Map to store it.");
+      setSiteMapMsg("Manual building outline drawn. Review it on the map.");
+      confirmBuildingOutlineAndProceed("manual outline");
     }
 
     function undoBuildingOutlinePoint() {
       if (!siteMapDrawingBuildingOutline) {
-        setSiteMapMsg("Start Manual Outline first to undo outline points.");
-        return;
+        const canReopenSaved = !!(siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) === 3 && siteMapConfig && siteMapConfig.building_outline);
+        if (!canReopenSaved) {
+          setSiteMapMsg("Start Manual Outline first to undo outline points.");
+          return;
+        }
+        const savedPts = buildingOutlineDraftPointsFromSaved();
+        if (!savedPts.length) {
+          setSiteMapMsg("No saved building outline points to edit.");
+          return;
+        }
+        siteMapDrawingBuildingOutline = true;
+        siteMapDraftBuildingOutlinePoints = savedPts;
+        siteMapConfig.building_outline = null;
+        renderSiteMapMarkers();
+        updateSiteMapWorkspaceStatus("Outline unlocked for edit");
       }
       if (!siteMapDraftBuildingOutlinePoints.length) {
         setSiteMapMsg("No outline points to undo.");
@@ -4368,11 +5118,14 @@ HTML = """<!doctype html>
       renderSiteMapMarkers();
       renderSiteMapDraftBuildingOutline();
       setOutlineWizardStep(3, "Building outline cleared. Use Auto Detect or Start Manual Outline.");
+      updateSiteMapZoneMappingAvailability();
       updateSiteMapWorkspaceStatus("Outline cleared");
       setSiteMapMsg("Building outline cleared. Click Save Map to store.");
     }
 
     function startZoneAreaDraw() {
+      if (!ensureBuildingSetupReadyForZoneMapping("draw zone areas")) return;
+      if (!siteMapOutlineWizardOpen) setSiteMapSetupMode("zone-downstream");
       enterSiteMapWorkspace({
         title: "Draw Zone Area",
         hint: "Tap the map to add points, then click Finish Area and Save & Finish.",
@@ -4380,6 +5133,11 @@ HTML = """<!doctype html>
       });
       const zoneId = selectedSiteMapZoneId();
       if (!zoneId) { setSiteMapMsg("Select a zone/device first."); return; }
+      if (isMainZoneId(zoneId)) {
+        setSiteMapMsg("Main boiler zones use a location pin only. Use 'Select Zone 1 Main Boiler' or 'Select Zone 2 Main Boiler' to place the main boiler pin.");
+        selectMainBoilerZone(zoneId, { preserveStep: true });
+        return;
+      }
       siteMapDrawingArea = true;
       siteMapDraftAreaPoints = [];
       renderSiteMapDraftArea();
@@ -4475,6 +5233,7 @@ HTML = """<!doctype html>
       pin.pump_voltage = (document.getElementById("siteMapPumpVoltage")?.value || "").trim();
       pin.pump_speed_mode = (document.getElementById("siteMapPumpSpeedMode")?.value || "").trim();
       pin.pump_serial = (document.getElementById("siteMapPumpSerial")?.value || "").trim();
+      pin.main_boiler_floor = String(pin.main_boiler_floor || "");
       pin.circuit_breaker_ref = document.getElementById("siteMapBreakerRef").value.trim();
       pin.installed_by = document.getElementById("siteMapInstalledBy").value.trim();
       pin.install_date = document.getElementById("siteMapInstallDate").value || "";
@@ -4570,12 +5329,14 @@ HTML = """<!doctype html>
       document.getElementById("zoneInfoPumpVoltage").textContent = pin.pump_voltage || "Not set";
       document.getElementById("zoneInfoPumpSpeedMode").textContent = pin.pump_speed_mode || "Not set";
       document.getElementById("zoneInfoPumpSerial").textContent = pin.pump_serial || "Not set";
+      document.getElementById("zoneInfoMainBoilerFloor").textContent = (mainZone && pin.main_boiler_floor) ? `Floor ${pin.main_boiler_floor}` : "Not set";
       document.getElementById("zoneInfoThermostatRow").classList.toggle("hidden", mainZone);
       document.getElementById("zoneInfoValveRow").classList.toggle("hidden", mainZone);
       document.getElementById("zoneInfoPumpModelRow").classList.toggle("hidden", !mainZone);
       document.getElementById("zoneInfoPumpVoltageRow").classList.toggle("hidden", !mainZone);
       document.getElementById("zoneInfoPumpSpeedModeRow").classList.toggle("hidden", !mainZone);
       document.getElementById("zoneInfoPumpSerialRow").classList.toggle("hidden", !mainZone);
+      document.getElementById("zoneInfoMainBoilerFloorRow").classList.toggle("hidden", !mainZone);
       document.getElementById("zoneInfoBreaker").textContent = pin.circuit_breaker_ref || "Not set";
       document.getElementById("zoneInfoInstalledBy").textContent = pin.installed_by || "Not set";
       document.getElementById("zoneInfoInstallDate").textContent = pin.install_date || "Not set";
@@ -5224,7 +5985,31 @@ HTML = """<!doctype html>
     if (firstZoneBtn) firstZoneBtn.addEventListener("click", openSetupPanel);
     document.getElementById("siteMapFindBtn").addEventListener("click", geocodeSiteAddress);
     document.getElementById("siteMapFootprintBtn").addEventListener("click", openBuildingOutlineWizard);
-    document.getElementById("siteMapOutlineWizardCloseBtn").addEventListener("click", () => showOutlineWizard(false));
+    document.getElementById("siteMapZoneSetupBtn").addEventListener("click", openZoneSetupWorkspace);
+    document.getElementById("siteMapOutlineWizardCloseBtn").addEventListener("click", exitBuildingSetupMode);
+    document.getElementById("siteMapZoneWizardExitBtn").addEventListener("click", exitZoneSetupMode);
+    document.getElementById("siteMapZoneWizardMainTabBtn").addEventListener("click", () => openZoneSetupWorkspace("zone-main"));
+    document.getElementById("siteMapZoneWizardDownstreamTabBtn").addEventListener("click", () => openZoneSetupWorkspace("zone-downstream"));
+    document.getElementById("siteMapZoneWizardPinZone1Btn").addEventListener("click", () => selectMainBoilerZone("zone1_main"));
+    document.getElementById("siteMapZoneWizardPinZone2Btn").addEventListener("click", () => selectMainBoilerZone("zone2_main"));
+    document.getElementById("siteMapZoneWizardRefreshZoneBtn").addEventListener("click", () => {
+      refreshSiteMapZoneSelect();
+      const sel = document.getElementById("siteMapZoneSelect");
+      const ds = realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []);
+      if (sel && ds.length) sel.value = String(ds[0].id);
+      syncSiteMapDetailsFormFromSelected();
+      setSiteMapMsg(ds.length ? "Downstream zone list refreshed. Select a zone/device and click inside the building outline to place a pin." : "No adopted downstream zones available yet.");
+      renderSiteMapZoneWizard();
+    });
+    document.getElementById("siteMapZoneWizardStartAreaBtn").addEventListener("click", () => {
+      const sel = document.getElementById("siteMapZoneSelect");
+      const zid = String(sel?.value || "");
+      if (!zid || isMainZoneId(zid)) {
+        setSiteMapMsg("Select a downstream zone/device first, then start zone area drawing.");
+        return;
+      }
+      startZoneAreaDraw();
+    });
     document.getElementById("siteMapOutlineStepFindBtn").addEventListener("click", geocodeSiteAddress);
     document.getElementById("siteMapOutlineStepAutoBtn").addEventListener("click", loadBuildingOutline);
     document.getElementById("siteMapOutlineStartDrawBtn").addEventListener("click", startBuildingOutlineDraw);
@@ -5233,6 +6018,8 @@ HTML = """<!doctype html>
     document.getElementById("siteMapOutlineClearBtn").addEventListener("click", clearBuildingOutline);
     document.getElementById("siteMapOutlineFloorsSaveBtn").addEventListener("click", saveBuildingFloorCount);
     document.getElementById("siteMapOutlineNextStepBtn").addEventListener("click", advanceOutlineWizardStep);
+    document.getElementById("siteMapOutlineContinueZoneSetupBtn").addEventListener("click", continueToZoneSetupWizard);
+    document.getElementById("siteMapOutlinePrevStepBtn").addEventListener("click", goToPreviousOutlineWizardStep);
     document.getElementById("siteMapApplyParentColorsBtn").addEventListener("click", applyParentColorsToZones);
     document.getElementById("siteMapSelectZone1MainBtn").addEventListener("click", () => selectMainBoilerZone("zone1_main"));
     document.getElementById("siteMapSelectZone2MainBtn").addEventListener("click", () => selectMainBoilerZone("zone2_main"));
@@ -5251,6 +6038,7 @@ HTML = """<!doctype html>
     document.getElementById("siteMapZoneSelect").addEventListener("change", () => {
       syncSiteMapDetailsFormFromSelected();
       updateSiteMapWorkspaceStatus();
+      renderSiteMapZoneWizard();
     });
     document.getElementById("siteMapLayer").addEventListener("change", (e) => setSiteMapBaseLayer((e && e.target && e.target.value) || "street"));
     document.addEventListener("keydown", (e) => {
@@ -5876,6 +6664,14 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 cfg["map_layer"] = str(body.get("map_layer") or cfg.get("map_layer") or "street")
+                bcp = body.get("building_confirm_pin")
+                if bcp is None:
+                    cfg["building_confirm_pin"] = None
+                elif isinstance(bcp, dict):
+                    try:
+                        cfg["building_confirm_pin"] = {"lat": float(bcp.get("lat")), "lng": float(bcp.get("lng"))}
+                    except Exception:
+                        pass
                 bo = body.get("building_outline")
                 if bo is None:
                     cfg["building_outline"] = None
@@ -5920,6 +6716,7 @@ class H(BaseHTTPRequestHandler):
                             "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
                             "pump_serial": str(p.get("pump_serial") or ""),
                             "pump_service_notes": str(p.get("pump_service_notes") or ""),
+                            "main_boiler_floor": str(p.get("main_boiler_floor") or ""),
                             "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                             "description": str(p.get("description") or ""),
                             "photo_data_url": str(p.get("photo_data_url") or ""),
