@@ -178,7 +178,8 @@ def default_config():
         },
         'alerts': {
             'low_temp_enabled': True,
-            'low_temp_threshold_f': 35.0
+            'low_temp_threshold_f': 35.0,
+            'probe_swap_idle_delta_threshold_f': 5.0,
         }
     }
 
@@ -215,6 +216,66 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + '\n')
+
+
+def reset_to_adoption_defaults(start_hotspot=True):
+    cfg = default_config()
+    # Keep hardware-fixed behavior.
+    cfg['call_gpio'] = 17
+    cfg['call_active_mode'] = 'dry_contact_to_gnd'
+    save_config(cfg)
+    hotspot_result = None
+    if start_hotspot:
+        hotspot_result = run_net_helper('ap-on', timeout=20)
+    return cfg, hotspot_result
+
+
+def recalc_configured(cfg):
+    cfg['configured'] = bool(cfg.get('unit_name')) and bool(cfg.get('feed_sensor_id')) and bool(cfg.get('return_sensor_id'))
+    return cfg
+
+
+def update_config_fields(cfg, body):
+    if not isinstance(body, dict):
+        return cfg
+    if 'unit_name' in body:
+        cfg['unit_name'] = str(body.get('unit_name') or '').strip() or cfg.get('unit_name') or 'Unnamed Zone Node'
+    if 'zone_id' in body:
+        cfg['zone_id'] = str(body.get('zone_id') or '').strip()
+    if 'parent_zone' in body:
+        cfg['parent_zone'] = str(body.get('parent_zone') or cfg.get('parent_zone') or 'Zone 1').strip()
+    if 'timezone' in body:
+        cfg['timezone'] = str(body.get('timezone') or cfg.get('timezone') or 'America/New_York').strip() or 'America/New_York'
+    if 'feed_sensor_id' in body:
+        cfg['feed_sensor_id'] = str(body.get('feed_sensor_id') or '').strip()
+    if 'return_sensor_id' in body:
+        cfg['return_sensor_id'] = str(body.get('return_sensor_id') or '').strip()
+    if 'hub' in body and isinstance(body.get('hub'), dict):
+        hub = cfg.get('hub', {}) if isinstance(cfg.get('hub'), dict) else {}
+        bh = body.get('hub') or {}
+        for k in ('hub_url', 'account_label', 'enroll_token'):
+            if k in bh:
+                hub[k] = str(bh.get(k) or '').strip()
+        cfg['hub'] = hub
+    if 'alerts' in body and isinstance(body.get('alerts'), dict):
+        alerts = cfg.get('alerts', {}) if isinstance(cfg.get('alerts'), dict) else {}
+        ba = body.get('alerts') or {}
+        if 'low_temp_enabled' in ba:
+            alerts['low_temp_enabled'] = bool(ba.get('low_temp_enabled'))
+        if 'low_temp_threshold_f' in ba:
+            try:
+                alerts['low_temp_threshold_f'] = float(ba.get('low_temp_threshold_f'))
+            except Exception:
+                pass
+        if 'probe_swap_idle_delta_threshold_f' in ba:
+            try:
+                alerts['probe_swap_idle_delta_threshold_f'] = float(ba.get('probe_swap_idle_delta_threshold_f'))
+            except Exception:
+                pass
+        cfg['alerts'] = alerts
+    cfg['call_gpio'] = 17
+    cfg['call_active_mode'] = 'dry_contact_to_gnd'
+    return recalc_configured(cfg)
 
 
 def read_temp_f(sensor_id):
@@ -288,6 +349,57 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
     else:
         low_temp_detail = ""
 
+    probes = list_probes()
+    diagnostics_issues = []
+    probe_swap_suspected = False
+    probe_swap_detail = ""
+    try:
+        probe_swap_idle_delta_f = float(alerts_cfg.get('probe_swap_idle_delta_threshold_f', 5.0))
+    except Exception:
+        probe_swap_idle_delta_f = 5.0
+    if len(probes) < 2:
+        diagnostics_issues.append(f"Only {len(probes)} probe(s) detected")
+    if not feed_id:
+        diagnostics_issues.append("Supply probe not assigned")
+    if not ret_id:
+        diagnostics_issues.append("Return probe not assigned")
+    if feed_id and ret_id and feed_id == ret_id:
+        diagnostics_issues.append("Supply and return assigned to same probe")
+    if feed_err and feed_err != 'unassigned':
+        diagnostics_issues.append(f"Supply probe error: {feed_err}")
+    if ret_err and ret_err != 'unassigned':
+        diagnostics_issues.append(f"Return probe error: {ret_err}")
+    if call_reader is None and call_reader_err:
+        diagnostics_issues.append(f"Call input error: {call_reader_err}")
+    # Field rule: during idle (no 24VAC call), feed should normally be the hotter pipe.
+    # If return is hotter by a meaningful margin, flag a likely swapped probe assignment.
+    if heating_call is False and feed_f is not None and ret_f is not None:
+        try:
+            idle_delta = float(ret_f) - float(feed_f)
+            if idle_delta >= probe_swap_idle_delta_f:
+                probe_swap_suspected = True
+                probe_swap_detail = (
+                    f"Probe swap suspected: return is hotter than feed during idle "
+                    f"by {idle_delta:.1f}F (threshold {probe_swap_idle_delta_f:.1f}F). "
+                    "Verify probe placement or use Swap Supply / Return."
+                )
+                diagnostics_issues.append(probe_swap_detail)
+        except Exception:
+            pass
+    diagnostics = {
+        'probe_count_detected': len(probes),
+        'probe_assignment_ok': bool(feed_id and ret_id and feed_id != ret_id),
+        'feed_probe_ok': feed_err is None,
+        'return_probe_ok': ret_err is None,
+        'call_input_ok': call_reader is not None and call_reader_err is None,
+        'probe_swap_suspected': probe_swap_suspected,
+        'probe_swap_detail': probe_swap_detail,
+        'probe_swap_idle_delta_threshold_f': probe_swap_idle_delta_f,
+        'hardware_fault': len(diagnostics_issues) > 0,
+        'hardware_faults': diagnostics_issues,
+        'self_diagnostic_status': 'Attention Required' if diagnostics_issues else 'Normal',
+    }
+
     return {
         'configured': bool(cfg.get('configured')),
         'unit_name': cfg.get('unit_name') or 'Unnamed Zone Node',
@@ -311,6 +423,7 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
         'low_temp_alert': low_temp_alert,
         'low_temp_status': low_temp_status,
         'low_temp_detail': low_temp_detail,
+        'diagnostics': diagnostics,
         'hub': cfg.get('hub', {}),
         'alerts': alerts_cfg,
         'updated_utc': now_utc_iso(),
@@ -401,7 +514,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
 <div class="wrap">
   <div class="hero">
     <h1>Zone Setup</h1>
-    <p>Phone-friendly setup for feed/return probe mapping, dry-contact call input, Wi-Fi assignment, and hub linking.</p>
+    <p>Phone-friendly setup for supply/return probe mapping, dry-contact call input, Wi-Fi assignment, and hub linking.</p>
   </div>
   <div class="grid">
     <div class="card">
@@ -449,7 +562,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
 
         <div class="row">
           <div>
-            <label>Feed Probe</label>
+            <label>Supply Probe</label>
             <select class="form-select" name="feed_sensor_id" id="feedSel"></select>
           </div>
           <div>
@@ -458,7 +571,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
         </div>
         <div>
-          <button type="button" class="secondary" id="swapProbesBtn">Swap Feed / Return</button>
+          <button type="button" class="secondary" id="swapProbesBtn">Swap Supply / Return</button>
         </div>
 
         <h2 style="margin-top:14px">Alerts</h2>
@@ -539,7 +652,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <div id="instructionsWrap" class="hidden">
           <div class="tabrow">
             <button type="button" class="itab active" data-itab="wiring">Wiring</button>
-            <button type="button" class="itab" data-itab="feedreturn">Feed vs Return</button>
+            <button type="button" class="itab" data-itab="feedreturn">Supply vs Return</button>
             <button type="button" class="itab" data-itab="probe">Probe Placement</button>
             <button type="button" class="itab" data-itab="mounting">Securing Probe</button>
             <button type="button" class="itab" data-itab="troubleshoot">Troubleshooting</button>
@@ -549,7 +662,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
             Add wiring diagrams and terminal references for dry-contact relay, GPIO input, and probe lead routing.
           </div>
           <div class="itpanel" data-ipanel="feedreturn">
-            <strong>Feed vs Return (placeholder)</strong><br>
+            <strong>Supply vs Return (placeholder)</strong><br>
             Add field guidance for identifying flow direction, reading temperatures, and marking pipes before assigning probes.
           </div>
           <div class="itpanel" data-ipanel="probe">
@@ -562,7 +675,7 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
           <div class="itpanel" data-ipanel="troubleshoot">
             <strong>Troubleshooting (placeholder)</strong><br>
-            Add checks for no probe reading, swapped feed/return, no 24VAC call, and Wi-Fi/Tailscale connectivity.
+            Add checks for no probe reading, swapped supply/return, no 24VAC call, and Wi-Fi/Tailscale connectivity.
           </div>
         </div>
       </div>
@@ -570,6 +683,13 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <small>Setup hotspot stays on during onboarding. Connect in iPhone Wi-Fi settings to <code>HeatingHub-Setup-xxxx</code>, then open <code>http://10.42.0.1:8090</code>. If Wi-Fi scan is unavailable in hotspot mode, use the manual SSID field.</small>
         <div style="margin-top:8px">
           <small>Hub Link: <a id="hubUrlLink" href="#" target="_blank" rel="noopener">Not set</a></small>
+        </div>
+      </div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <h2 style="margin:0 0 8px">Advanced / Service</h2>
+        <small>Use this only when repurposing the device for a new install.</small>
+        <div style="margin-top:8px">
+          <button type="button" class="warn" id="resetDeviceBtn">Reset Device for New Install</button>
         </div>
       </div>
     </div>
@@ -821,7 +941,7 @@ async function refreshLive(){
         <div class="live-v">${data.call_status || '--'}</div>
       </div>
       <div class="live-item">
-        <div class="live-k">Feed Temperature</div>
+        <div class="live-k">Supply Temperature</div>
         <div class="live-v temp">${fmt(data.feed_f)}</div>
         <div class="live-k" style="margin-top:6px">Probe</div>
         <div class="live-v" style="font-size:.88rem;font-weight:600">${data.feed_sensor_id || '--'}${feedErr}</div>
@@ -945,6 +1065,21 @@ document.getElementById('showInstructionsBtn').addEventListener('click', ()=>{
 document.querySelectorAll('[data-itab]').forEach(btn => {
   btn.addEventListener('click', ()=> activateInstructionTab(btn.dataset.itab));
 });
+document.getElementById('resetDeviceBtn').addEventListener('click', async ()=>{
+  const ok = confirm('Reset this device to adoption defaults? This clears unit name, zone ID, probe assignment, Wi-Fi, and hub settings, and returns it to setup hotspot mode.');
+  if(!ok) return;
+  setMsg('Resetting device to adoption defaults...');
+  try {
+    const res = await j('/api/reset-device', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ start_hotspot: true }) });
+    showSetupSuccess(false);
+    showInstructions(false);
+    setWifiMode('manual');
+    setMsg((res.message || 'Device reset complete.') + '\\nReconnect to the setup hotspot and continue adoption.');
+    await refreshAll(); await refreshWifiStatus(); await refreshLive();
+  } catch (e) {
+    setMsg('Reset failed: ' + e.message);
+  }
+});
 refreshAll().then(async ()=>{
   const currentHub = (document.getElementById('setupForm').hub_url.value || '').trim();
   if (!currentHub && !hubAutoDiscoverTried) {
@@ -964,7 +1099,7 @@ def html_demo_page():
     demo = demo.replace('<title>Zone Setup</title>', '<title>Zone Setup Demo</title>', 1)
     demo = demo.replace('<h1>Zone Setup</h1>', '<h1>Zone Setup Demo</h1>', 1)
     demo = demo.replace(
-        '<p>Phone-friendly setup for feed/return probe mapping, dry-contact call input, Wi-Fi assignment, and hub linking.</p>',
+        '<p>Phone-friendly setup for supply/return probe mapping, dry-contact call input, Wi-Fi assignment, and hub linking.</p>',
         '<p>Read-only demo preview of the installer onboarding page. This view does not save changes or control any device.</p>',
         1,
     )
@@ -1158,6 +1293,17 @@ class H(BaseHTTPRequestHandler):
             return self._send_json(payload)
         if route == '/api/hub/discover':
             return self._send_json(discover_hubs())
+        if route == '/api/manage/status':
+            cfg = load_config()
+            safe_cfg = json.loads(json.dumps(cfg))
+            if isinstance(safe_cfg.get('wifi'), dict):
+                safe_cfg['wifi']['password'] = ''
+            return self._send_json({
+                'config': safe_cfg,
+                'zone': get_payload(),
+                'setup_state': {'configured': bool(cfg.get('configured')), 'probes_detected': list_probes(), 'probe_choices': probe_choices()},
+                'updated_utc': now_utc_iso(),
+            })
         return self._send_json({'error': 'not found'}, 404)
 
     def do_POST(self):
@@ -1177,6 +1323,52 @@ class H(BaseHTTPRequestHandler):
                 'message': 'Demo mode: configuration preview only (nothing was saved)',
                 'wifi_apply': {'ok': True, 'stdout': 'demo', 'stderr': ''},
             })
+
+        if route == '/api/reset-device':
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+            except Exception:
+                n = 0
+            raw = self.rfile.read(n) if n > 0 else b'{}'
+            try:
+                body = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                body = {}
+            start_hotspot = True
+            if isinstance(body, dict) and 'start_hotspot' in body:
+                start_hotspot = bool(body.get('start_hotspot'))
+            cfg, hotspot_result = reset_to_adoption_defaults(start_hotspot=start_hotspot)
+            return self._send_json({
+                'ok': True,
+                'message': 'Device reset to adoption defaults',
+                'config': cfg,
+                'hotspot': hotspot_result,
+                'updated_utc': now_utc_iso(),
+            })
+
+        if route in ('/api/manage/swap-probes', '/api/manage/update'):
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+            except Exception:
+                n = 0
+            raw = self.rfile.read(n) if n > 0 else b'{}'
+            try:
+                body = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                body = {}
+            cfg = load_config()
+            if route == '/api/manage/swap-probes':
+                a = str(cfg.get('feed_sensor_id') or '')
+                b = str(cfg.get('return_sensor_id') or '')
+                cfg['feed_sensor_id'], cfg['return_sensor_id'] = b, a
+                recalc_configured(cfg)
+                save_config(cfg)
+                return self._send_json({'ok': True, 'message': 'Feed/return probes swapped', 'config': cfg, 'zone': get_payload(), 'updated_utc': now_utc_iso()})
+            cfg = update_config_fields(cfg, body if isinstance(body, dict) else {})
+            if cfg.get('feed_sensor_id') and cfg.get('return_sensor_id') and cfg.get('feed_sensor_id') == cfg.get('return_sensor_id'):
+                return self._send_json({'error': 'feed and return probes must differ'}, 400)
+            save_config(cfg)
+            return self._send_json({'ok': True, 'message': 'Zone device settings updated', 'config': cfg, 'zone': get_payload(), 'updated_utc': now_utc_iso()})
 
         if route != '/api/setup':
             return self._send_json({'error': 'not found'}, 404)
