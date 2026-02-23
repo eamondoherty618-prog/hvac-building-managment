@@ -38,6 +38,7 @@ ALERT_LOG_PATH = Path("/home/eamondoherty618/alert_events.log")
 USERS_CONFIG_PATH = Path("/home/eamondoherty618/hub_users.json")
 ALERT_EVENTS_JSONL_PATH = Path("/home/eamondoherty618/hub_alert_events.jsonl")
 SITE_MAP_CONFIG_PATH = Path("/home/eamondoherty618/hub_site_map.json")
+COMMISSIONING_CONFIG_PATH = Path("/home/eamondoherty618/hub_commissioning.json")
 DEFAULT_ALERT_COOLDOWN_MIN = 120
 ZONE1_CALL_ALERT_GRACE_SECONDS = 120
 PUBLIC_HUB_URL = "https://165-boiler.tail58e171.ts.net/"
@@ -50,6 +51,8 @@ DEFAULT_ALERT_PREFS = {
     "low_temp": True,
     "device_offline": True,
     "device_recovered": True,
+    "hardware_fault": True,
+    "hardware_recovered": True,
 }
 
 DEFAULT_CONFIG = {
@@ -94,6 +97,7 @@ cycle_state_lock = threading.Lock()
 cycle_trackers = {}
 perf_alert_last_sent = {}
 downstream_offline_state = {}
+downstream_hardware_state = {}
 
 main_call_input = None
 if Button is not None:
@@ -217,9 +221,121 @@ def default_site_map_config():
         "address": "",
         "center": {"lat": 41.307, "lng": -72.927},
         "zoom": 16,
+        "map_layer": "street",
+        "building_outline": None,
         "pins": {},
         "updated_utc": now_utc_iso(),
     }
+
+
+def default_commissioning_config():
+    return {"records": {}, "updated_utc": now_utc_iso()}
+
+
+def load_commissioning_config():
+    if not COMMISSIONING_CONFIG_PATH.exists():
+        cfg = default_commissioning_config()
+        save_commissioning_config(cfg)
+        return cfg
+    try:
+        data = json.loads(COMMISSIONING_CONFIG_PATH.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not dict")
+        out = default_commissioning_config()
+        recs = data.get("records", {})
+        if isinstance(recs, dict):
+            norm = {}
+            for zid, rec in recs.items():
+                if not isinstance(rec, dict):
+                    continue
+                checks = rec.get("checks", {}) if isinstance(rec.get("checks"), dict) else {}
+                norm[str(zid)] = {
+                    "checks": {
+                        "call_input_verified": bool(checks.get("call_input_verified", False)),
+                        "feed_return_confirmed": bool(checks.get("feed_return_confirmed", False)),
+                        "temp_response_verified": bool(checks.get("temp_response_verified", False)),
+                        "photo_added": bool(checks.get("photo_added", False)),
+                        "pin_placed": bool(checks.get("pin_placed", False)),
+                        "alert_test_completed": bool(checks.get("alert_test_completed", False)),
+                    },
+                    "notes": str(rec.get("notes") or ""),
+                    "completed_by": str(rec.get("completed_by") or ""),
+                    "completed_utc": str(rec.get("completed_utc") or ""),
+                    "updated_utc": str(rec.get("updated_utc") or now_utc_iso()),
+                }
+            out["records"] = norm
+        out["updated_utc"] = str(data.get("updated_utc") or now_utc_iso())
+        return out
+    except Exception:
+        cfg = default_commissioning_config()
+        save_commissioning_config(cfg)
+        return cfg
+
+
+def save_commissioning_config(cfg):
+    try:
+        COMMISSIONING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        COMMISSIONING_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def backup_export_bundle():
+    alert_cfg = load_alert_config()
+    alert_export = json.loads(json.dumps(alert_cfg)) if isinstance(alert_cfg, dict) else {}
+    if isinstance(alert_export.get("email"), dict) and "password" in alert_export["email"]:
+        alert_export["email"]["password"] = ""
+    if isinstance(alert_export.get("sms"), dict):
+        for k in ("auth_token", "token", "account_sid", "sid"):
+            if k in alert_export["sms"]:
+                alert_export["sms"][k] = ""
+    return {
+        "format": "hvac-hub-backup-v1",
+        "created_utc": now_utc_iso(),
+        "hub_site_name": HUB_SITE_NAME,
+        "public_hub_url": PUBLIC_HUB_URL,
+        "downstream_zones": {"zones": load_config()},
+        "users": load_users_config(),
+        "site_map": load_site_map_config(),
+        "commissioning": load_commissioning_config(),
+        "alerts": alert_export,
+    }
+
+
+def restore_from_backup_bundle(bundle):
+    if not isinstance(bundle, dict):
+        return False, "backup payload must be an object"
+    if str(bundle.get("format") or "") != "hvac-hub-backup-v1":
+        return False, "unsupported backup format"
+    if isinstance(bundle.get("downstream_zones"), dict):
+        zones = bundle["downstream_zones"].get("zones", [])
+        if isinstance(zones, list):
+            if not save_config_zones(zones):
+                return False, "failed to restore downstream zones"
+    if isinstance(bundle.get("users"), dict):
+        if not save_users_config(bundle["users"]):
+            return False, "failed to restore users"
+    if isinstance(bundle.get("site_map"), dict):
+        if not save_site_map_config(bundle["site_map"]):
+            return False, "failed to restore site map"
+    if isinstance(bundle.get("commissioning"), dict):
+        if not save_commissioning_config(bundle["commissioning"]):
+            return False, "failed to restore commissioning"
+    if isinstance(bundle.get("alerts"), dict):
+        current = load_alert_config()
+        incoming = json.loads(json.dumps(bundle["alerts"]))
+        # Preserve existing secrets unless explicitly supplied.
+        if isinstance(incoming.get("email"), dict) and isinstance(current.get("email"), dict):
+            if not str(incoming["email"].get("password") or "").strip():
+                incoming["email"]["password"] = current["email"].get("password", "")
+        if isinstance(incoming.get("sms"), dict) and isinstance(current.get("sms"), dict):
+            for k in ("auth_token", "token", "account_sid", "sid"):
+                if not str(incoming["sms"].get(k) or "").strip():
+                    incoming["sms"][k] = current["sms"].get(k, "")
+        if not save_alert_config(incoming):
+            return False, "failed to restore alerts config"
+    return True, "Backup restored"
 
 
 def load_site_map_config():
@@ -245,6 +361,10 @@ def load_site_map_config():
             cfg["zoom"] = int(data.get("zoom", cfg["zoom"]))
         except Exception:
             pass
+        cfg["map_layer"] = str(data.get("map_layer") or "street")
+        bo = data.get("building_outline")
+        if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
+            cfg["building_outline"] = bo
         pins_in = data.get("pins", {}) if isinstance(data.get("pins"), dict) else {}
         pins_out = {}
         for zid, p in pins_in.items():
@@ -268,9 +388,15 @@ def load_site_map_config():
                 "last_service_date": str(p.get("last_service_date") or ""),
                 "thermostat_location": str(p.get("thermostat_location") or ""),
                 "valve_actuator_type": str(p.get("valve_actuator_type") or ""),
+                "pump_model": str(p.get("pump_model") or ""),
+                "pump_voltage": str(p.get("pump_voltage") or ""),
+                "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
+                "pump_serial": str(p.get("pump_serial") or ""),
+                "pump_service_notes": str(p.get("pump_service_notes") or ""),
                 "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                 "description": str(p.get("description") or ""),
                 "photo_data_url": str(p.get("photo_data_url") or ""),
+                "polygon": p.get("polygon") if isinstance(p.get("polygon"), list) else [],
                 "updated_utc": str(p.get("updated_utc") or now_utc_iso()),
             }
         cfg["pins"] = pins_out
@@ -298,6 +424,10 @@ def save_site_map_config(cfg):
                 cfg_out["zoom"] = max(1, min(22, int(cfg.get("zoom", cfg_out["zoom"]))))
             except Exception:
                 pass
+            cfg_out["map_layer"] = str(cfg.get("map_layer") or "street")
+            bo = cfg.get("building_outline")
+            if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
+                cfg_out["building_outline"] = bo
             pins = cfg.get("pins", {})
             if isinstance(pins, dict):
                 cfg_out["pins"] = {}
@@ -322,11 +452,28 @@ def save_site_map_config(cfg):
                         "last_service_date": str(p.get("last_service_date") or ""),
                         "thermostat_location": str(p.get("thermostat_location") or ""),
                         "valve_actuator_type": str(p.get("valve_actuator_type") or ""),
+                        "pump_model": str(p.get("pump_model") or ""),
+                        "pump_voltage": str(p.get("pump_voltage") or ""),
+                        "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
+                        "pump_serial": str(p.get("pump_serial") or ""),
+                        "pump_service_notes": str(p.get("pump_service_notes") or ""),
                         "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                         "description": str(p.get("description") or ""),
                         "photo_data_url": str(p.get("photo_data_url") or ""),
+                        "polygon": [],
                         "updated_utc": str(p.get("updated_utc") or now_utc_iso()),
                     }
+                    poly = p.get("polygon")
+                    if isinstance(poly, list):
+                        norm_poly = []
+                        for pt in poly:
+                            if not isinstance(pt, dict):
+                                continue
+                            try:
+                                norm_poly.append({"lat": float(pt.get("lat")), "lng": float(pt.get("lng"))})
+                            except Exception:
+                                continue
+                        cfg_out["pins"][str(zid)]["polygon"] = norm_poly
         cfg_out["updated_utc"] = now_utc_iso()
         SITE_MAP_CONFIG_PATH.write_text(json.dumps(cfg_out, indent=2) + "\n")
         return True
@@ -335,6 +482,11 @@ def save_site_map_config(cfg):
 
 
 def recipients_for_alert_code(alert_code, alert_cfg):
+    # Route specialized hardware diagnostics through the existing hardware subscriptions.
+    if alert_code == "probe_swap_suspected":
+        alert_code = "hardware_fault"
+    elif alert_code == "probe_swap_recovered":
+        alert_code = "hardware_recovered"
     users_cfg = load_users_config()
     out = []
     for u in users_cfg.get("users", []):
@@ -629,6 +781,107 @@ def maybe_send_device_offline_alerts(downstream_rows):
         downstream_offline_state[zone_id] = state
 
 
+def maybe_send_downstream_hardware_alerts(downstream_rows):
+    global downstream_hardware_state
+    rows = downstream_rows if isinstance(downstream_rows, list) else []
+    cfg = load_alert_config()
+    cooldown_sec = alert_cooldown_seconds(cfg)
+    now = now_utc()
+    for z in rows:
+        if not isinstance(z, dict):
+            continue
+        zone_id = str(z.get("id") or "").strip()
+        if not zone_id:
+            continue
+        zone_label = str(z.get("name") or zone_id)
+        diag = z.get("diagnostics", {}) if isinstance(z.get("diagnostics"), dict) else {}
+        configured = bool(z.get("configured"))
+        if not configured:
+            # Ignore unconfigured node hardware faults in operational alerts.
+            downstream_hardware_state[zone_id] = {"fault": False, "last_sent": downstream_hardware_state.get(zone_id, {}).get("last_sent"), "alerted": False}
+            continue
+        faults = []
+        if z.get("feed_error"):
+            faults.append(f"Feed probe error: {z.get('feed_error')}")
+        if z.get("return_error"):
+            faults.append(f"Return probe error: {z.get('return_error')}")
+        if isinstance(diag.get("hardware_faults"), list):
+            for f in diag.get("hardware_faults"):
+                fs = str(f or "").strip()
+                if fs and fs not in faults:
+                    faults.append(fs)
+        probe_swap_suspected = bool(diag.get("probe_swap_suspected"))
+        probe_swap_detail = str(diag.get("probe_swap_detail") or "").strip()
+        fault_active = bool(diag.get("hardware_fault")) or bool(faults)
+        state = downstream_hardware_state.get(zone_id, {"fault": False, "last_sent": None, "alerted": False, "kind": None})
+        if fault_active and not state.get("fault"):
+            last_sent = state.get("last_sent")
+            if not (isinstance(last_sent, datetime) and (now - last_sent).total_seconds() < cooldown_sec):
+                detail = "; ".join(faults) or "Hardware self-diagnostic reported an issue"
+                if probe_swap_suspected:
+                    detail = probe_swap_detail or detail or "Probe swap suspected"
+                    subject = f"165 Water Street Heating Hub - Probe Swap Suspected ({zone_label})"
+                    body = (
+                        "165 Water Street Heating Hub Alert\n\n"
+                        f"Zone: {zone_label}\n"
+                        f"Zone ID: {zone_id}\n"
+                        "Alert Type: Probe Swap Suspected\n"
+                        f"Error Description: {detail}\n"
+                        "Recommendation: Verify feed/return probe placement or use Swap Feed / Return in Zone Management.\n"
+                        f"Time: {now.isoformat()}\n\n"
+                        f"Live Hub: {PUBLIC_HUB_URL}\n"
+                    )
+                    dispatch_alert_by_category("probe_swap_suspected", zone_id, zone_label, subject, body, f"probe_swap_suspected:{zone_id}", detail)
+                    state["kind"] = "probe_swap"
+                else:
+                    subject = f"165 Water Street Heating Hub - Hardware Fault ({zone_label})"
+                    body = (
+                        "165 Water Street Heating Hub Alert\n\n"
+                        f"Zone: {zone_label}\n"
+                        f"Zone ID: {zone_id}\n"
+                        "Alert Type: Hardware Fault\n"
+                        f"Error Description: {detail}\n"
+                        f"Time: {now.isoformat()}\n\n"
+                        f"Live Hub: {PUBLIC_HUB_URL}\n"
+                    )
+                    dispatch_alert_by_category("hardware_fault", zone_id, zone_label, subject, body, f"hardware_fault:{zone_id}", detail)
+                    state["kind"] = "hardware"
+                state["last_sent"] = now
+                state["alerted"] = True
+        elif (not fault_active) and state.get("fault") and state.get("alerted"):
+            if state.get("kind") == "probe_swap":
+                detail = "Probe swap suspicion cleared"
+                subject = f"165 Water Street Heating Hub - Probe Swap Recovered ({zone_label})"
+                body = (
+                    "165 Water Street Heating Hub Alert\n\n"
+                    f"Zone: {zone_label}\n"
+                    f"Zone ID: {zone_id}\n"
+                    "Alert Type: Probe Swap Recovered\n"
+                    "Status: Probe swap diagnostic is now normal\n"
+                    f"Time: {now.isoformat()}\n\n"
+                    f"Live Hub: {PUBLIC_HUB_URL}\n"
+                )
+                dispatch_alert_by_category("probe_swap_recovered", zone_id, zone_label, subject, body, f"probe_swap_recovered:{zone_id}", detail)
+            else:
+                detail = "Hardware self-diagnostic normal"
+                subject = f"165 Water Street Heating Hub - Hardware Recovered ({zone_label})"
+                body = (
+                    "165 Water Street Heating Hub Alert\n\n"
+                    f"Zone: {zone_label}\n"
+                    f"Zone ID: {zone_id}\n"
+                    "Alert Type: Hardware Recovered\n"
+                    "Status: Hardware self-diagnostic normal\n"
+                    f"Time: {now.isoformat()}\n\n"
+                    f"Live Hub: {PUBLIC_HUB_URL}\n"
+                )
+                dispatch_alert_by_category("hardware_recovered", zone_id, zone_label, subject, body, f"hardware_recovered:{zone_id}", detail)
+            state["last_sent"] = now
+            state["alerted"] = False
+            state["kind"] = None
+        state["fault"] = fault_active
+        downstream_hardware_state[zone_id] = state
+
+
 def maybe_send_cycle_performance_alert(event):
     if not isinstance(event, dict):
         return
@@ -696,8 +949,8 @@ def evaluate_zone1_main_status(readings, call_active, threshold_f=ZONE1_DELTA_TH
             return "Notify Admin", "Call active, missing feed/return temperature", True
         delta = abs(float(feed) - float(ret))
         if delta <= threshold_f:
-            return "Calling, Normal", f"delta {delta:.1f}F <= {threshold_f:.1f}F", False
-        return "Notify Admin", f"delta {delta:.1f}F > {threshold_f:.1f}F", True
+            return "Calling, Normal", f"Feed/return temperatures are within expected range ({delta:.1f}F difference)", False
+        return "Notify Admin", f"Feed/return temperatures are not matching expected response ({delta:.1f}F difference; alert threshold {threshold_f:.1f}F)", True
 
     if call_active is False:
         return "Idle", "No 24VAC", False
@@ -891,6 +1144,25 @@ def load_config():
     return []
 
 
+def save_config_zones(zones):
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps({"zones": zones}, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def zone_config_entry(zone_id):
+    zid = str(zone_id or "").strip()
+    if not zid:
+        return None
+    for z in load_config():
+        if isinstance(z, dict) and str(z.get("id") or "").strip() == zid:
+            return dict(z)
+    return None
+
+
 def as_float(v):
     try:
         if v is None:
@@ -917,6 +1189,18 @@ def as_bool(v):
 def fetch_remote_json(url):
     try:
         with urlopen(url, timeout=2.5) as r:
+            return json.loads(r.read().decode("utf-8")), None
+    except (HTTPError, URLError, TimeoutError, OSError) as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"bad_json: {e}"
+
+
+def post_remote_json(url, payload, timeout=5):
+    try:
+        data = json.dumps(payload or {}).encode("utf-8")
+        req = Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8")), None
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         return None, str(e)
@@ -956,8 +1240,8 @@ def evaluate_status(feed_f, return_f, heating_call, delta_ok_f):
             return "trouble", "Call Active - Temp Data Missing", "verify probe readings"
         delta = abs(feed_f - return_f)
         if delta <= delta_ok_f:
-            return "normal", "Calling Active", f"delta {delta:.1f}F (within {delta_ok_f:.1f}F)"
-        return "trouble", "Call Active - No Temperature Response", f"delta {delta:.1f}F exceeds {delta_ok_f:.1f}F"
+            return "normal", "Calling Active", f"Temperatures responding normally ({delta:.1f}F difference)"
+        return "trouble", "Call Active - No Temperature Response", f"Temperatures not responding as expected ({delta:.1f}F difference; limit {delta_ok_f:.1f}F)"
     if heating_call is False:
         return "standby", "Idle", "no heat call"
     return "trouble", "Signal Unknown", "24VAC call state unavailable"
@@ -988,6 +1272,10 @@ def downstream_payload():
             "zone_status": "Signal Unknown",
             "status_note": "no source configured",
             "updated_utc": None,
+            "configured": None,
+            "feed_error": None,
+            "return_error": None,
+            "diagnostics": {},
         }
 
         if source_url:
@@ -999,6 +1287,12 @@ def downstream_payload():
                 item["status_note"] = f"source error: {err}"
             else:
                 feed_f, return_f, heating_call, updated = parse_remote_payload(raw)
+                if isinstance(raw, dict):
+                    item["configured"] = raw.get("configured")
+                    item["feed_error"] = raw.get("feed_error")
+                    item["return_error"] = raw.get("return_error")
+                    if isinstance(raw.get("diagnostics"), dict):
+                        item["diagnostics"] = raw.get("diagnostics")
                 status, zone_status, note = evaluate_status(feed_f, return_f, heating_call, delta_ok_f)
                 item.update(
                     {
@@ -1042,6 +1336,7 @@ def make_sample(local=None, downstream=None):
         downstream_map[z.get("id", "unknown")] = {
             "feed_f": z.get("feed_f"),
             "return_f": z.get("return_f"),
+            "call": z.get("heating_call"),
         }
     return {
         "ts": now_utc_iso(),
@@ -1050,6 +1345,7 @@ def make_sample(local=None, downstream=None):
             "return_1": main.get("return_1", {}).get("temp_f"),
             "feed_2": main.get("feed_2", {}).get("temp_f"),
             "return_2": main.get("return_2", {}).get("temp_f"),
+            "call_zone1": local.get("main_call_24vac") if isinstance(local, dict) else None,
         },
         "downstream": downstream_map,
     }
@@ -1374,6 +1670,10 @@ def sample_loop():
                 maybe_send_device_offline_alerts(downstream)
             except Exception:
                 pass
+            try:
+                maybe_send_downstream_hardware_alerts(downstream)
+            except Exception:
+                pass
             update_all_cycle_tracking(local, downstream)
             trigger_zone1_alert_from_local(local)
             loops += 1
@@ -1441,6 +1741,15 @@ HTML = """<!doctype html>
     .head-pill-btn{border:1px solid rgba(255,255,255,.26);border-radius:999px;padding:7px 12px;font-weight:700;background:rgba(255,255,255,.1);color:#f2fbff;cursor:pointer}
     .head-pill-btn:hover{background:rgba(255,255,255,.16)}
     .head-pill-btn .sub{display:block;font-size:.72rem;font-weight:600;opacity:.9;line-height:1.1}
+    .head-pill-btn.attn{border-color:rgba(255,120,120,.95); background:rgba(165,29,45,.28)}
+    .head-pill-btn .badge-dot{display:none;margin-left:6px;min-width:18px;height:18px;border-radius:999px;background:#ff6b6b;color:#fff;font-size:.72rem;line-height:18px;text-align:center;font-weight:800;vertical-align:middle;padding:0 4px}
+    .head-pill-btn.attn .badge-dot{display:inline-block}
+    .head-action-wrap{position:relative}
+    .head-menu{position:absolute;right:0;top:calc(100% + 8px);min-width:240px;background:#fff;color:#16303b;border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 28px rgba(10,31,44,.18);padding:8px;z-index:1500;display:none}
+    .head-menu.show{display:block}
+    .head-menu .mitem{display:block;width:100%;text-align:left;background:#fff;border:1px solid transparent;border-radius:10px;padding:9px 10px;font-weight:700;color:#1f3340;cursor:pointer}
+    .head-menu .mitem:hover{background:#f4fafc;border-color:var(--border)}
+    .head-menu .mitem .sub{display:block;font-size:.78rem;color:var(--muted);font-weight:600;margin-top:2px}
 
     .main-grid { margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; }
     .card { background:linear-gradient(180deg,#ffffff,#fbfdff); border:1px solid var(--border); border-radius:16px; padding:14px; box-shadow:0 10px 24px rgba(10,31,44,.08); }
@@ -1488,6 +1797,12 @@ HTML = """<!doctype html>
     .smallnote{font-size:.82rem;color:var(--muted)}
     .msg{margin-top:8px;font-weight:700;color:#114b5f;white-space:pre-wrap}
     .hidden{display:none !important}
+    .admin-tools-wrap{margin-top:10px}
+    .admin-tools-wrap > summary{cursor:pointer;font-weight:700;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:#fff}
+    .admin-tools-wrap > summary::-webkit-details-marker{display:none}
+    .admin-tools-wrap > summary::after{content:"Open";font-size:.8rem;color:var(--muted);font-weight:600}
+    .admin-tools-wrap[open] > summary::after{content:"Hide"}
+    .admin-tools-wrap .admin-tools-inner{margin-top:10px}
     .fab-top{
       position:fixed; right:18px; bottom:18px; z-index:1200;
       border:1px solid var(--border); border-radius:999px; padding:10px 14px;
@@ -1509,6 +1824,15 @@ HTML = """<!doctype html>
     .zone-info-card{max-width:760px;width:min(100%,760px);max-height:88vh;overflow:auto;background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 18px 36px rgba(10,31,44,.24);padding:14px}
     .zone-info-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:12px}
     .zone-info-photo{width:100%;aspect-ratio:4/3;object-fit:cover;border:1px solid var(--border);border-radius:12px;background:#f2f7fa}
+    .overview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:10px}
+    .overview-kpi{border:1px solid var(--border);border-radius:12px;padding:10px;background:#f8fbfd}
+    .overview-kpi .k{font-size:.78rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.03em}
+    .overview-kpi .v{font-size:1.15rem;font-weight:800;margin-top:4px}
+    .overview-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:10px}
+    .overview-card{border:1px solid var(--border);border-radius:12px;padding:10px;background:#fff}
+    .overview-card .t{font-weight:800}
+    .overview-card .s{font-size:.85rem;color:var(--muted)}
+    .overview-card .line{font-size:.9rem;margin-top:4px}
     @media (max-width:760px){.zone-info-grid{grid-template-columns:1fr}}
     @media (max-width:760px) {
       .wrap { padding:.75rem; }
@@ -1533,8 +1857,15 @@ HTML = """<!doctype html>
         <div class=\"meta\">Main Boiler Zone(s) + Heating Zones</div>
       </div>
       <div style=\"display:flex;gap:8px;flex-wrap:wrap\">
-        <button id=\"alertPill\" type=\"button\" class=\"head-pill-btn\">Trouble Zones: --<span class=\"sub\">Open Trouble Log</span></button>
-        <button id=\"unackPill\" type=\"button\" class=\"head-pill-btn\">Alerts To Acknowledge: --<span class=\"sub\">Open Alert Log</span></button>
+        <div class=\"head-action-wrap\">
+          <button id=\"tasksPill\" type=\"button\" class=\"head-pill-btn\" aria-expanded=\"false\" aria-controls=\"tasksMenu\">Tasks: -- <span class=\"badge-dot\" id=\"tasksPillDot\">!</span><span class=\"sub\">Open Tasks Menu</span></button>
+          <div id=\"tasksMenu\" class=\"head-menu\" role=\"menu\" aria-label=\"Tasks Menu\">
+            <button type=\"button\" class=\"mitem\" id=\"tasksMenuUnack\" role=\"menuitem\">Acknowledge Alerts<span class=\"sub\">Open alerts that still need acknowledgement</span></button>
+            <button type=\"button\" class=\"mitem\" id=\"tasksMenuAckAll\" role=\"menuitem\">Acknowledge All Visible<span class=\"sub\">Bulk acknowledge alerts in the current visible tasks view</span></button>
+            <button type=\"button\" class=\"mitem\" id=\"tasksMenuTrouble\" role=\"menuitem\">Trouble Log<span class=\"sub\">Open current trouble events and active issues</span></button>
+            <button type=\"button\" class=\"mitem\" id=\"tasksMenuAll\" role=\"menuitem\">Alert Log<span class=\"sub\">Open all recent alert events</span></button>
+          </div>
+        </div>
         <button id=\"addDevicePill\" type=\"button\" class=\"head-pill-btn\">Add Device<span class=\"sub\">Open Setup New Device</span></button>
       </div>
     </header>
@@ -1562,6 +1893,40 @@ HTML = """<!doctype html>
 
     <section class=\"chart-wrap\">
       <div class=\"chart-head\">
+        <h3>Zone Performance Overview</h3>
+        <div class=\"smallnote\">Click a parent zone to see its downstream devices and quick performance stats, then jump to the graph.</div>
+      </div>
+      <div id=\"overviewParentTabs\" class=\"tabs\" style=\"margin-top:10px\">
+        <button class=\"tab active\" data-overview-parent=\"Zone 1\">Zone 1</button>
+        <button class=\"tab\" data-overview-parent=\"Zone 2\">Zone 2</button>
+      </div>
+      <div id=\"overviewKpis\" class=\"overview-grid\"></div>
+      <div id=\"overviewCards\" class=\"overview-list\"></div>
+    </section>
+
+    <section class=\"chart-wrap\">
+      <div class=\"chart-head\">
+        <h3>Admin Tools</h3>
+        <div class=\"smallnote\">Manage who receives which alerts and acknowledge dispatched alarms</div>
+      </div>
+      <div style=\"display:flex;justify-content:flex-end;margin-top:8px\">
+        <button type=\"button\" class=\"btn\" data-return-main>Return to Main</button>
+      </div>
+      <details id=\"adminToolsDetails\" class=\"admin-tools-wrap\">
+        <summary>Admin Tools</summary>
+        <div class=\"admin-tools-inner\">
+      <div class=\"tabs\" id=\"adminTabs\" style=\"margin-top:10px\">
+        <button class=\"tab active\" data-admin-tab=\"users\">Users</button>
+        <button class=\"tab\" data-admin-tab=\"alerts\">Alarm Acknowledge</button>
+        <button class=\"tab\" data-admin-tab=\"zones\">Zone Management</button>
+        <button class=\"tab\" data-admin-tab=\"commissioning\">Commissioning</button>
+        <button class=\"tab\" data-admin-tab=\"backup\">Backup / Restore</button>
+        <button class=\"tab\" data-admin-tab=\"map\">Site Map</button>
+        <button class=\"tab\" data-admin-tab=\"setup\">Setup New Device</button>
+      </div>
+
+    <section class=\"chart-wrap\">
+      <div class=\"chart-head\">
         <h3 id=\"graphTitle\">Zone Graph</h3>
         <div class=\"btns\">
           <button class=\"btn active\" data-range=\"live\">LIVE</button>
@@ -1578,6 +1943,7 @@ HTML = """<!doctype html>
       <div class=\"legend\">
         <span><span class=\"dot\" style=\"background:#0f766e\"></span>Feed</span>
         <span><span class=\"dot\" style=\"background:#ef4444\"></span>Return</span>
+        <span><span class=\"dot\" style=\"background:#93c5fd\"></span>24VAC Call Active</span>
       </div>
     </section>
 
@@ -1611,7 +1977,18 @@ HTML = """<!doctype html>
       <div class=\"smallnote\" id=\"cycleOpenNote\" style=\"margin-top:6px\"></div>
     </section>
 
-    <section class=\"subzones\">
+    <section id=\"downstreamEmptyState\" class=\"chart-wrap hidden\">
+      <div class=\"chart-head\">
+        <h3>Heating Zones</h3>
+        <div class=\"smallnote\">No downstream devices adopted yet</div>
+      </div>
+      <div style=\"margin-top:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap\">
+        <div>Set up your first zone device and assign it to a zone to start seeing downstream readings and cycle analytics.</div>
+        <button type=\"button\" class=\"btn active\" id=\"firstZoneSetupBtn\">Set Up Your First Zone</button>
+      </div>
+    </section>
+
+    <section id=\"subzonesSection\" class=\"subzones\">
       <div class=\"subzones-head\">
         <h3>Downstream Sub-Zones</h3>
         <div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap\">
@@ -1639,9 +2016,11 @@ HTML = """<!doctype html>
       </div>
       <form id=\"notifForm\" class=\"form-grid\" style=\"margin-top:10px\">
         <div class=\"full\">
-          <label class=\"label\" for=\"notifEmails\">Alert Email Recipients</label>
-          <input id=\"notifEmails\" class=\"input\" placeholder=\"eamon@easternstandard.co, manager@example.com\">
-          <div class=\"smallnote\">Comma-separated email addresses</div>
+          <label class=\"label\">Alert Recipients</label>
+          <div class=\"smallnote\">Recipients are managed in the <strong>Users</strong> tab. Add users there, then choose roles and which alert types each user receives.</div>
+          <div style=\"margin-top:8px\">
+            <button type=\"button\" class=\"btn\" id=\"openUsersFromNotifBtn\">Manage Users</button>
+          </div>
         </div>
         <div>
           <label class=\"label\" for=\"notifCooldown\">Repeat Alert Cooldown (minutes)</label>
@@ -1662,22 +2041,8 @@ HTML = """<!doctype html>
       <div id=\"notifMsg\" class=\"msg\"></div>
     </section>
 
-    <section class=\"chart-wrap\">
-      <div class=\"chart-head\">
-        <h3>Team, Roles & Alarm Acknowledge</h3>
-        <div class=\"smallnote\">Manage who receives which alerts and acknowledge dispatched alarms</div>
-      </div>
-      <div style=\"display:flex;justify-content:flex-end;margin-top:8px\">
-        <button type=\"button\" class=\"btn\" data-return-main>Return to Main</button>
-      </div>
-      <div class=\"tabs\" id=\"adminTabs\" style=\"margin-top:10px\">
-        <button class=\"tab active\" data-admin-tab=\"users\">Users / Roles</button>
-        <button class=\"tab\" data-admin-tab=\"alerts\">Alarm Acknowledge</button>
-        <button class=\"tab\" data-admin-tab=\"map\">Site Map</button>
-        <button class=\"tab\" data-admin-tab=\"setup\">Setup New Device</button>
-      </div>
-
       <div id=\"adminUsersPanel\" style=\"margin-top:12px\">
+        <div class=\"smallnote\" style=\"margin-bottom:8px\">Manage users, roles, and alert subscriptions.</div>
         <div class=\"form-grid\">
           <div>
             <label class=\"label\" for=\"userName\">Name</label>
@@ -1713,6 +2078,8 @@ HTML = """<!doctype html>
               <label><input type=\"checkbox\" data-alert-pref=\"low_temp\" checked> Low Temp</label>
               <label><input type=\"checkbox\" data-alert-pref=\"device_offline\" checked> Device Offline</label>
               <label><input type=\"checkbox\" data-alert-pref=\"device_recovered\" checked> Device Recovered</label>
+              <label><input type=\"checkbox\" data-alert-pref=\"hardware_fault\" checked> Hardware Fault</label>
+              <label><input type=\"checkbox\" data-alert-pref=\"hardware_recovered\" checked> Hardware Recovered</label>
             </div>
           </div>
           <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
@@ -1746,9 +2113,11 @@ HTML = """<!doctype html>
           <div class=\"full\">
             <label class=\"label\" for=\"ackNote\">Acknowledge Note</label>
             <input id=\"ackNote\" class=\"input\" placeholder=\"Tech dispatched / monitoring / resolved cause identified\">
+            <div class=\"smallnote\">Optional. You can use Quick Ack without entering a name or note.</div>
           </div>
           <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
             <button type=\"button\" class=\"btn\" id=\"refreshAlertsBtn\">Refresh Alerts</button>
+            <button type=\"button\" class=\"btn\" id=\"ackAllVisibleBtn\">Acknowledge All Visible</button>
           </div>
           <div class=\"full\">
             <div class=\"tabs\" id=\"alertLogFilterTabs\" style=\"margin-top:4px\">
@@ -1767,6 +2136,86 @@ HTML = """<!doctype html>
         </div>
       </div>
 
+      <div id=\"adminZonesPanel\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+          <h4 style=\"margin:0 0 8px\">Zone Management (Adopted Devices)</h4>
+          <div class=\"smallnote\">Post-install changes and diagnostics for adopted zone nodes. Use this instead of the setup page for normal service updates.</div>
+          <div class=\"form-grid\" style=\"margin-top:10px\">
+            <div>
+              <label class=\"label\" for=\"zoneMgmtSelect\">Zone Device</label>
+              <select id=\"zoneMgmtSelect\" class=\"select\"></select>
+            </div>
+            <div style=\"display:flex;align-items:end;gap:8px\">
+              <button type=\"button\" class=\"btn\" id=\"zoneMgmtRefreshBtn\">Refresh Diagnostics</button>
+              <button type=\"button\" class=\"btn\" id=\"zoneMgmtSwapBtn\">Swap Feed / Return</button>
+            </div>
+            <div>
+              <label class=\"label\" for=\"zoneMgmtName\">Display Name</label>
+              <input id=\"zoneMgmtName\" class=\"input\" placeholder=\"Production Area Heating Coil 1\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"zoneMgmtParent\">Parent Zone</label>
+              <select id=\"zoneMgmtParent\" class=\"select\">
+                <option>Zone 1</option>
+                <option>Zone 2</option>
+                <option>Zone 3</option>
+                <option>Other</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"zoneMgmtZoneId\">Zone ID (View Only)</label>
+              <input id=\"zoneMgmtZoneId\" class=\"input\" placeholder=\"zone1-production-coil-1\" readonly>
+            </div>
+            <div>
+              <label class=\"label\">Current Probe Assignment</label>
+              <div id=\"zoneMgmtProbeSummary\" class=\"smallnote\">--</div>
+            </div>
+            <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+              <button type=\"button\" class=\"btn active\" id=\"zoneMgmtSaveBtn\">Save Zone Changes</button>
+            </div>
+            <div class=\"full\">
+              <details style=\"border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff\">
+                <summary style=\"cursor:pointer;font-weight:600\">Advanced Settings</summary>
+                <div class=\"form-grid\" style=\"margin-top:10px\">
+                  <div>
+                    <label class=\"label\" for=\"zoneMgmtLowTemp\">Low Temp Alert Threshold (F)</label>
+                    <input id=\"zoneMgmtLowTemp\" class=\"input\" type=\"number\" step=\"0.5\" min=\"0\">
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"zoneMgmtLowTempEnabled\">Low Temp Alerts</label>
+                    <select id=\"zoneMgmtLowTempEnabled\" class=\"select\">
+                      <option value=\"true\">Enabled</option>
+                      <option value=\"false\">Disabled</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"zoneMgmtProbeSwapDelta\">Probe Swap Suspected Threshold (Idle Delta F)</label>
+                    <input id=\"zoneMgmtProbeSwapDelta\" class=\"input\" type=\"number\" step=\"0.5\" min=\"0\">
+                    <div class=\"smallnote\">During idle (no 24VAC), flag if return is hotter than feed by this amount.</div>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div id=\"zoneMgmtMsg\" class=\"msg\"></div>
+          <div class=\"form-grid\" style=\"margin-top:10px\">
+            <div class=\"full\">
+              <div class=\"label\">Hardware Self-Diagnostic</div>
+              <div id=\"zoneMgmtDiagStatus\" class=\"smallnote\">--</div>
+              <div id=\"zoneMgmtDiagIssues\" class=\"smallnote\" style=\"margin-top:6px;white-space:pre-wrap\"></div>
+            </div>
+            <div>
+              <div class=\"label\">Feed Probe</div>
+              <div id=\"zoneMgmtFeedDiag\" class=\"smallnote\">--</div>
+            </div>
+            <div>
+              <div class=\"label\">Return Probe</div>
+              <div id=\"zoneMgmtReturnDiag\" class=\"smallnote\">--</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id=\"adminMapPanel\" class=\"hidden\" style=\"margin-top:12px\">
         <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
           <h4 style=\"margin:0 0 8px\">Building / Zone Device Map</h4>
@@ -1779,11 +2228,19 @@ HTML = """<!doctype html>
             <div>
               <label class=\"label\" for=\"siteMapZoneSelect\">Zone / Device</label>
               <select id=\"siteMapZoneSelect\" class=\"select\"></select>
+              <div class=\"smallnote\">Only adopted/assigned zone devices appear here (plus Zone 1 and Zone 2 main).</div>
             </div>
             <button type=\"button\" class=\"btn\" id=\"siteMapFindBtn\">Find Address</button>
             <button type=\"button\" class=\"btn active\" id=\"siteMapSaveBtn\">Save Map</button>
           </div>
           <div class=\"site-map-subtools\">
+            <div>
+              <label class=\"label\" for=\"siteMapLayer\">Map View</label>
+              <select id=\"siteMapLayer\" class=\"select\">
+                <option value=\"street\">Street</option>
+                <option value=\"satellite\">Satellite</option>
+              </select>
+            </div>
             <div>
               <label class=\"label\" for=\"siteMapZoom\">Zoom</label>
               <input id=\"siteMapZoom\" class=\"input\" type=\"number\" min=\"1\" max=\"22\" step=\"1\" value=\"16\">
@@ -1792,7 +2249,14 @@ HTML = """<!doctype html>
               <label class=\"label\" for=\"siteMapCenter\">Map Center</label>
               <input id=\"siteMapCenter\" class=\"input\" readonly placeholder=\"Lat, Lng\">
             </div>
+            <button type=\"button\" class=\"btn\" id=\"siteMapFootprintBtn\">Load Building Outline</button>
             <button type=\"button\" class=\"btn\" id=\"siteMapClearPinBtn\">Clear Selected Pin</button>
+          </div>
+          <div class=\"site-map-subtools\" style=\"margin-top:8px\">
+            <button type=\"button\" class=\"btn\" id=\"siteMapStartAreaBtn\">Start Zone Area</button>
+            <button type=\"button\" class=\"btn\" id=\"siteMapFinishAreaBtn\">Finish Area</button>
+            <button type=\"button\" class=\"btn\" id=\"siteMapCancelAreaBtn\">Cancel Area</button>
+            <button type=\"button\" class=\"btn\" id=\"siteMapClearAreaBtn\">Clear Selected Area</button>
           </div>
           <div class=\"form-grid\" style=\"margin-top:10px\">
             <div>
@@ -1814,29 +2278,21 @@ HTML = """<!doctype html>
               <label class=\"label\" for=\"siteMapRoomArea\">Room / Area Name</label>
               <input id=\"siteMapRoomArea\" class=\"input\" placeholder=\"AV Room / 1st Floor Production / Basement Mech Room\">
             </div>
-            <div>
+            <div id=\"siteMapThermostatWrap\">
               <label class=\"label\" for=\"siteMapThermostatLoc\">Thermostat Location</label>
               <input id=\"siteMapThermostatLoc\" class=\"input\" placeholder=\"South wall by door / office interior wall\">
             </div>
-            <div>
+            <div id=\"siteMapValveWrap\">
               <label class=\"label\" for=\"siteMapValveType\">Valve / Actuator Type</label>
               <input id=\"siteMapValveType\" class=\"input\" placeholder=\"2-way zone valve / Belimo actuator / Taco zone valve\">
             </div>
-            <div>
-              <label class=\"label\" for=\"siteMapBreakerRef\">Circuit / Breaker Reference</label>
-              <input id=\"siteMapBreakerRef\" class=\"input\" placeholder=\"Panel L1 / Breaker 12\">
+            <div id=\"siteMapPumpModelWrap\" class=\"hidden\">
+              <label class=\"label\" for=\"siteMapPumpModel\">Circulator Pump Model (Optional)</label>
+              <input id=\"siteMapPumpModel\" class=\"input\" placeholder=\"Taco 0015e3 / Grundfos UPS15-58FC\">
             </div>
-            <div>
-              <label class=\"label\" for=\"siteMapInstalledBy\">Installed By</label>
-              <input id=\"siteMapInstalledBy\" class=\"input\" placeholder=\"Tech / contractor name\">
-            </div>
-            <div>
-              <label class=\"label\" for=\"siteMapInstallDate\">Install Date</label>
-              <input id=\"siteMapInstallDate\" class=\"input\" type=\"date\">
-            </div>
-            <div>
-              <label class=\"label\" for=\"siteMapLastServiceDate\">Last Service Date</label>
-              <input id=\"siteMapLastServiceDate\" class=\"input\" type=\"date\">
+            <div id=\"siteMapPumpVoltageWrap\" class=\"hidden\">
+              <label class=\"label\" for=\"siteMapPumpVoltage\">Pump Voltage (Optional)</label>
+              <input id=\"siteMapPumpVoltage\" class=\"input\" placeholder=\"120VAC / 208VAC / 24VAC control\">
             </div>
             <div class=\"full\">
               <label class=\"label\" for=\"siteMapDesc\">Location Description</label>
@@ -1846,13 +2302,48 @@ HTML = """<!doctype html>
               <label class=\"label\" for=\"siteMapAccessInstructions\">Access Instructions</label>
               <textarea id=\"siteMapAccessInstructions\" class=\"input\" rows=\"2\" placeholder=\"Use 8' ladder, remove 2nd ceiling tile from east wall, power panel access required.\"></textarea>
             </div>
+            <div class=\"full\">
+              <details style=\"border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff\">
+                <summary style=\"cursor:pointer;font-weight:600\">Advanced Details (Optional)</summary>
+                <div class=\"form-grid\" style=\"margin-top:10px\">
+                  <div id=\"siteMapPumpSpeedModeWrap\" class=\"hidden\">
+                    <label class=\"label\" for=\"siteMapPumpSpeedMode\">Pump Speed Setting / ECM Mode</label>
+                    <input id=\"siteMapPumpSpeedMode\" class=\"input\" placeholder=\"Speed 2 / Constant Pressure / AutoAdapt\">
+                  </div>
+                  <div id=\"siteMapPumpSerialWrap\" class=\"hidden\">
+                    <label class=\"label\" for=\"siteMapPumpSerial\">Pump Serial #</label>
+                    <input id=\"siteMapPumpSerial\" class=\"input\" placeholder=\"Serial number / equipment label\">
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"siteMapBreakerRef\">Circuit / Breaker Reference</label>
+                    <input id=\"siteMapBreakerRef\" class=\"input\" placeholder=\"Panel L1 / Breaker 12\">
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"siteMapInstalledBy\">Installed By</label>
+                    <input id=\"siteMapInstalledBy\" class=\"input\" placeholder=\"Tech / contractor name\">
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"siteMapInstallDate\">Install Date</label>
+                    <input id=\"siteMapInstallDate\" class=\"input\" type=\"date\">
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"siteMapLastServiceDate\">Last Service Date</label>
+                    <input id=\"siteMapLastServiceDate\" class=\"input\" type=\"date\">
+                  </div>
+                  <div id=\"siteMapPumpServiceNotesWrap\" class=\"full hidden\">
+                    <label class=\"label\" for=\"siteMapPumpServiceNotes\">Pump Service Notes</label>
+                    <textarea id=\"siteMapPumpServiceNotes\" class=\"input\" rows=\"2\" placeholder=\"Speed set to 2 / ECM mode updated / cartridge replaced\"></textarea>
+                  </div>
+                </div>
+              </details>
+            </div>
             <div>
               <label class=\"label\" for=\"siteMapPhotoInput\">Zone Photo</label>
               <input id=\"siteMapPhotoInput\" class=\"input\" type=\"file\" accept=\"image/*\" capture=\"environment\">
               <div class=\"smallnote\">On mobile, this can open the camera.</div>
             </div>
             <div style=\"display:flex;align-items:end;gap:8px\">
-              <button type=\"button\" class=\"btn\" id=\"siteMapClearPhotoBtn\">Clear Photo</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapClearPhotoBtn\">Remove Saved Photo</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapApplyDetailsBtn\">Apply Details to Selected Zone</button>
             </div>
             <div class=\"full\">
@@ -1860,9 +2351,73 @@ HTML = """<!doctype html>
             </div>
           </div>
           <div id=\"siteMapCanvas\" style=\"margin-top:10px\"></div>
-          <div class=\"smallnote\" style=\"margin-top:8px\">Tip: Choose a zone/device, then tap the map where that unit is roughly located.</div>
+          <div class=\"smallnote\" style=\"margin-top:8px\">Tip: Choose a zone/device, then tap the map to place a pin. Use Start Zone Area to sketch a rough served area polygon.</div>
           <div id=\"siteMapMsg\" class=\"msg\"></div>
           <div id=\"siteMapPinsList\" class=\"pin-list\"></div>
+        </div>
+      </div>
+
+      <div id=\"adminCommissioningPanel\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+          <h4 style=\"margin:0 0 8px\">Commissioning Checklist</h4>
+          <div class=\"smallnote\">Track install verification steps for each main zone or adopted zone device.</div>
+          <div class=\"form-grid\" style=\"margin-top:10px\">
+            <div>
+              <label class=\"label\" for=\"commissionZoneSelect\">Zone / Device</label>
+              <select id=\"commissionZoneSelect\" class=\"select\"></select>
+            </div>
+            <div style=\"display:flex;align-items:end;gap:8px\">
+              <button type=\"button\" class=\"btn\" id=\"commissionRefreshBtn\">Load Checklist</button>
+            </div>
+            <div class=\"full\">
+              <div class=\"label\" style=\"margin-bottom:6px\">Checklist</div>
+              <div class=\"d-flex flex-wrap gap-3\" id=\"commissionChecks\">
+                <label><input type=\"checkbox\" data-commission-check=\"call_input_verified\"> Call Input Verified</label>
+                <label><input type=\"checkbox\" data-commission-check=\"feed_return_confirmed\"> Feed / Return Confirmed</label>
+                <label><input type=\"checkbox\" data-commission-check=\"temp_response_verified\"> Temp Response Verified</label>
+                <label><input type=\"checkbox\" data-commission-check=\"photo_added\"> Photo Added</label>
+                <label><input type=\"checkbox\" data-commission-check=\"pin_placed\"> Map Pin Placed</label>
+                <label><input type=\"checkbox\" data-commission-check=\"alert_test_completed\"> Alert Test Completed</label>
+              </div>
+            </div>
+            <div>
+              <label class=\"label\" for=\"commissionCompletedBy\">Completed By</label>
+              <input id=\"commissionCompletedBy\" class=\"input\" placeholder=\"Tech name / initials\">
+            </div>
+            <div>
+              <label class=\"label\">Completion</label>
+              <div id=\"commissionSummary\" class=\"smallnote\">0 / 6 complete</div>
+            </div>
+            <div class=\"full\">
+              <label class=\"label\" for=\"commissionNotes\">Commissioning Notes</label>
+              <textarea id=\"commissionNotes\" class=\"input\" rows=\"3\" placeholder=\"Notes about verification, observed temps, corrections made, etc.\"></textarea>
+            </div>
+            <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+              <button type=\"button\" class=\"btn active\" id=\"commissionSaveBtn\">Save Checklist</button>
+            </div>
+          </div>
+          <div id=\"commissionMsg\" class=\"msg\"></div>
+        </div>
+      </div>
+
+      <div id=\"adminBackupPanel\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+          <h4 style=\"margin:0 0 8px\">Backup / Restore</h4>
+          <div class=\"smallnote\">Export or restore hub configuration (zones, users, alerts, site map, commissioning). Secrets are redacted in exports.</div>
+          <div class=\"form-grid\" style=\"margin-top:10px\">
+            <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+              <button type=\"button\" class=\"btn\" id=\"backupExportBtn\">Generate Backup JSON</button>
+              <button type=\"button\" class=\"btn active\" id=\"backupRestoreBtn\">Restore From JSON</button>
+            </div>
+            <div class=\"full\">
+              <label class=\"label\" for=\"backupJson\">Backup JSON</label>
+              <textarea id=\"backupJson\" class=\"input\" rows=\"10\" placeholder='{"format":"hvac-hub-backup-v1", ...}'></textarea>
+            </div>
+            <div class=\"full\">
+              <label><input type=\"checkbox\" id=\"backupRestoreConfirm\"> I understand restore will overwrite current hub configuration.</label>
+            </div>
+          </div>
+          <div id=\"backupMsg\" class=\"msg\"></div>
         </div>
       </div>
 
@@ -1896,6 +2451,8 @@ HTML = """<!doctype html>
           </div>
         </div>
       </div>
+        </div>
+      </details>
     </section>
   </div>
   <button id=\"floatingTopBtn\" type=\"button\" class=\"fab-top\" aria-label=\"Back to top\">Back to Top</button>
@@ -1913,8 +2470,12 @@ HTML = """<!doctype html>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Zone / Device</div></div><div id=\"zoneInfoLabel\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Room / Area</div></div><div id=\"zoneInfoRoomArea\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Equipment Type</div></div><div id=\"zoneInfoEquip\">--</div></div>
-          <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Thermostat Location</div></div><div id=\"zoneInfoThermostat\">--</div></div>
-          <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Valve / Actuator</div></div><div id=\"zoneInfoValve\">--</div></div>
+          <div id=\"zoneInfoThermostatRow\" class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Thermostat Location</div></div><div id=\"zoneInfoThermostat\">--</div></div>
+          <div id=\"zoneInfoValveRow\" class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Valve / Actuator</div></div><div id=\"zoneInfoValve\">--</div></div>
+          <div id=\"zoneInfoPumpModelRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Circulator Pump Model</div></div><div id=\"zoneInfoPumpModel\">--</div></div>
+          <div id=\"zoneInfoPumpVoltageRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Voltage</div></div><div id=\"zoneInfoPumpVoltage\">--</div></div>
+          <div id=\"zoneInfoPumpSpeedModeRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Speed / ECM Mode</div></div><div id=\"zoneInfoPumpSpeedMode\">--</div></div>
+          <div id=\"zoneInfoPumpSerialRow\" class=\"row hidden\" style=\"padding:6px 0\"><div><div class=\"label\">Pump Serial #</div></div><div id=\"zoneInfoPumpSerial\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Circuit / Breaker</div></div><div id=\"zoneInfoBreaker\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Installed By</div></div><div id=\"zoneInfoInstalledBy\">--</div></div>
           <div class=\"row\" style=\"padding:6px 0\"><div><div class=\"label\">Install Date</div></div><div id=\"zoneInfoInstallDate\">--</div></div>
@@ -1932,6 +2493,10 @@ HTML = """<!doctype html>
         <div class=\"label\">Access Instructions</div>
         <div id=\"zoneInfoAccess\" style=\"margin-top:6px;white-space:pre-wrap;border:1px solid var(--border);border-radius:10px;padding:10px;background:#f8fbfd\">--</div>
       </div>
+      <div id=\"zoneInfoPumpServiceNotesWrap\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"label\">Pump Service Notes</div>
+        <div id=\"zoneInfoPumpServiceNotes\" style=\"margin-top:6px;white-space:pre-wrap;border:1px solid var(--border);border-radius:10px;padding:10px;background:#f8fbfd\">--</div>
+      </div>
       <div id=\"zoneInfoLive\" class=\"smallnote\" style=\"margin-top:10px\"></div>
     </div>
   </div>
@@ -1948,10 +2513,20 @@ HTML = """<!doctype html>
     let usersCache = [];
     let alertEventsCache = [];
     let activeAlertLogFilter = "trouble";
+    let zoneMgmtStatusCache = null;
+    let commissioningCache = { records: {} };
     let lastHubPayload = null;
+    let activeOverviewParent = "Zone 1";
     let siteMapConfig = null;
     let siteMapMap = null;
     let siteMapMarkers = {};
+    let siteMapZonePolygons = {};
+    let siteMapBaseLayers = {};
+    let siteMapActiveLayerKey = "street";
+    let siteMapBuildingOutlineLayer = null;
+    let siteMapDraftAreaPoints = [];
+    let siteMapDraftAreaLayer = null;
+    let siteMapDrawingArea = false;
     let siteMapReady = false;
     const livePoints = [];
     const LIVE_MAX_POINTS = 240;
@@ -1992,6 +2567,13 @@ HTML = """<!doctype html>
       };
       return m[String(name || "").toLowerCase()] || m.red;
     }
+    function parentZoneColorHex(parentZone) {
+      const p = String(parentZone || "").toLowerCase();
+      if (p === "zone 1") return "#dc2626";
+      if (p === "zone 2") return "#2563eb";
+      if (p === "zone 3") return "#16a34a";
+      return "#7c3aed";
+    }
 
     function evaluateZone1Status(readings, callActive) {
       const feed = readings && readings.feed_1 ? readings.feed_1.temp_f : null;
@@ -2020,16 +2602,305 @@ HTML = """<!doctype html>
       return "st-trouble";
     }
 
+    function isPlaceholderZone(z) {
+      const url = String((z && z.source_url) || "");
+      return /:\/\/100\.100\.100\.\d+/.test(url);
+    }
+
+    function isAdoptedZone(z) {
+      const url = String((z && z.source_url) || "").trim();
+      if (!url) return false;
+      if (isPlaceholderZone(z)) return false;
+      return true;
+    }
+
+    function realDownstreamRows(rows) {
+      return (rows || []).filter((z) => isAdoptedZone(z));
+    }
+
+    function ensureAdminToolsOpen() {
+      const d = document.getElementById("adminToolsDetails");
+      if (d && !d.open) d.open = true;
+    }
+    function scrollToAdminPanel(panelId) {
+      ensureAdminToolsOpen();
+      const panel = document.getElementById(panelId);
+      const adminWrap = document.getElementById("adminToolsDetails");
+      if (adminWrap) adminWrap.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (panel) {
+        setTimeout(() => {
+          panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 80);
+      }
+    }
+
+    function openSetupPanel() {
+      ensureAdminToolsOpen();
+      setAdminTab("setup");
+      scrollToAdminPanel("adminSetupPanel");
+    }
+
+    function openUsersPanel() {
+      ensureAdminToolsOpen();
+      setAdminTab("users");
+      scrollToAdminPanel("adminUsersPanel");
+    }
+
+    function commissioningZoneOptions() {
+      return siteMapZoneOptions().filter((o) => {
+        if (o.id === "zone1_main" || o.id === "zone2_main") return true;
+        const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+        const row = ds.find((z) => String(z.id || "") === String(o.id));
+        return row ? isAdoptedZone(row) : false;
+      });
+    }
+
+    function refreshCommissioningZoneSelect() {
+      const sel = document.getElementById("commissionZoneSelect");
+      if (!sel) return;
+      const prev = sel.value;
+      const opts = commissioningZoneOptions();
+      sel.innerHTML = "";
+      if (!opts.length) {
+        const op = document.createElement("option");
+        op.value = "";
+        op.textContent = "-- No zones available --";
+        sel.appendChild(op);
+        return;
+      }
+      opts.forEach((o) => {
+        const op = document.createElement("option");
+        op.value = o.id;
+        op.textContent = o.label;
+        sel.appendChild(op);
+      });
+      if (opts.some((o) => o.id === prev)) sel.value = prev;
+    }
+
+    function currentCommissionChecks() {
+      const checks = {};
+      document.querySelectorAll("[data-commission-check]").forEach((cb) => {
+        checks[cb.dataset.commissionCheck] = !!cb.checked;
+      });
+      return checks;
+    }
+
+    function updateCommissioningSummary() {
+      const checks = currentCommissionChecks();
+      const keys = Object.keys(checks);
+      const total = keys.length;
+      const done = keys.filter((k) => checks[k]).length;
+      const el = document.getElementById("commissionSummary");
+      if (el) el.textContent = `${done} / ${total} complete`;
+    }
+
+    function fillCommissioningForm(zoneId, rec) {
+      const r = (rec && typeof rec === "object") ? rec : {};
+      const checks = (r.checks && typeof r.checks === "object") ? r.checks : {};
+      document.querySelectorAll("[data-commission-check]").forEach((cb) => {
+        cb.checked = !!checks[cb.dataset.commissionCheck];
+      });
+      document.getElementById("commissionCompletedBy").value = r.completed_by || "";
+      document.getElementById("commissionNotes").value = r.notes || "";
+      updateCommissioningSummary();
+      if (r.completed_utc) {
+        setCommissionMsg(`Checklist loaded. Completed: ${String(r.completed_utc).replace("T", " ").replace("+00:00", " UTC")}`);
+      } else {
+        setCommissionMsg(zoneId ? "Checklist loaded." : "");
+      }
+    }
+
+    async function loadCommissioningRecord(zoneId) {
+      if (!zoneId) {
+        fillCommissioningForm("", {});
+        setCommissionMsg("Select a zone/device.");
+        return;
+      }
+      setCommissionMsg("Loading checklist...");
+      try {
+        const res = await fetch(`/api/commissioning?zone_id=${encodeURIComponent(zoneId)}&_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "load failed");
+        commissioningCache = data;
+        fillCommissioningForm(zoneId, data.record || {});
+      } catch (e) {
+        setCommissionMsg("Load failed: " + e.message);
+      }
+    }
+
+    async function saveCommissioningRecord() {
+      const zoneId = String(document.getElementById("commissionZoneSelect").value || "").trim();
+      if (!zoneId) { setCommissionMsg("Select a zone/device."); return; }
+      setCommissionMsg("Saving checklist...");
+      try {
+        const res = await fetch("/api/commissioning/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            zone_id: zoneId,
+            checks: currentCommissionChecks(),
+            completed_by: document.getElementById("commissionCompletedBy").value.trim(),
+            notes: document.getElementById("commissionNotes").value.trim(),
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "save failed");
+        commissioningCache = data;
+        fillCommissioningForm(zoneId, data.record || {});
+        setCommissionMsg(data.message || "Checklist saved.");
+      } catch (e) {
+        setCommissionMsg("Save failed: " + e.message);
+      }
+    }
+
+    async function exportBackupJson() {
+      setBackupMsg("Generating backup...");
+      try {
+        const res = await fetch(`/api/backup/export?_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "export failed");
+        document.getElementById("backupJson").value = JSON.stringify(data, null, 2);
+        setBackupMsg("Backup JSON generated.");
+      } catch (e) {
+        setBackupMsg("Export failed: " + e.message);
+      }
+    }
+
+    async function restoreBackupJson() {
+      const confirmBox = document.getElementById("backupRestoreConfirm");
+      if (!confirmBox || !confirmBox.checked) {
+        setBackupMsg("Check the confirmation box before restoring.");
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(document.getElementById("backupJson").value || "{}");
+      } catch (_) {
+        setBackupMsg("Backup JSON is invalid.");
+        return;
+      }
+      setBackupMsg("Restoring backup...");
+      try {
+        const res = await fetch("/api/backup/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok || data.error || data.ok === false) throw new Error(data.error || data.message || "restore failed");
+        setBackupMsg(data.message || "Backup restored.");
+        await Promise.all([refreshHub(), loadUsers(), loadAlertEvents(), loadNotifications(), loadSiteMapConfig()]);
+        refreshCommissioningZoneSelect();
+      } catch (e) {
+        setBackupMsg("Restore failed: " + e.message);
+      }
+    }
+
+    function setDownstreamVisibility(hasRealDevices) {
+      const sub = document.getElementById("subzonesSection");
+      const empty = document.getElementById("downstreamEmptyState");
+      if (sub) sub.classList.toggle("hidden", !hasRealDevices);
+      if (empty) empty.classList.toggle("hidden", !!hasRealDevices);
+    }
+
+    function setOverviewParent(parentName) {
+      activeOverviewParent = parentName || "Zone 1";
+      document.querySelectorAll("[data-overview-parent]").forEach((b) => {
+        b.classList.toggle("active", b.dataset.overviewParent === activeOverviewParent);
+      });
+      renderZoneOverview();
+    }
+
+    function focusZoneGraph(zoneGraphId, cycleZoneId) {
+      if (zoneGraphId) currentTabId = zoneGraphId;
+      if (cycleZoneId) activeCycleZoneId = cycleZoneId;
+      const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+      updateTabs(ds);
+      updateCycleTabs(ds);
+      renderSelectedGraph();
+      refreshCycles();
+      const graph = document.getElementById("graphTitle");
+      if (graph) graph.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    function renderZoneOverview() {
+      const kpiEl = document.getElementById("overviewKpis");
+      const cardsEl = document.getElementById("overviewCards");
+      if (!kpiEl || !cardsEl) return;
+      const hub = lastHubPayload || {};
+      const dsAll = realDownstreamRows(Array.isArray(hub.downstream) ? hub.downstream : []);
+      const ds = dsAll.filter((z) => String(z.parent_zone || "") === String(activeOverviewParent));
+      const troubleCount = ds.filter((z) => String(z.status || "") === "trouble").length;
+      const callingCount = ds.filter((z) => z.heating_call === true).length;
+      const onlineCount = ds.filter((z) => String(z.zone_status || "") !== "Source Unreachable").length;
+      const feedVals = ds.map((z) => Number(z.feed_f)).filter((v) => Number.isFinite(v));
+      const retVals = ds.map((z) => Number(z.return_f)).filter((v) => Number.isFinite(v));
+      const avg = (arr) => arr.length ? (arr.reduce((a,b)=>a+b,0) / arr.length).toFixed(1) + " °F" : "--";
+
+      let mainFeed = "--", mainRet = "--", mainCall = "--";
+      if (hub.main && hub.main.readings) {
+        if (activeOverviewParent === "Zone 1") {
+          mainFeed = fmtTemp(hub.main.readings.feed_1 && hub.main.readings.feed_1.temp_f);
+          mainRet = fmtTemp(hub.main.readings.return_1 && hub.main.readings.return_1.temp_f);
+          mainCall = hub.main.main_call_status || "--";
+        } else if (activeOverviewParent === "Zone 2") {
+          mainFeed = fmtTemp(hub.main.readings.feed_2 && hub.main.readings.feed_2.temp_f);
+          mainRet = fmtTemp(hub.main.readings.return_2 && hub.main.readings.return_2.temp_f);
+          mainCall = "Main call not monitored";
+        }
+      }
+
+      kpiEl.innerHTML = `
+        <div class="overview-kpi"><div class="k">${activeOverviewParent} Main Feed</div><div class="v">${mainFeed}</div></div>
+        <div class="overview-kpi"><div class="k">${activeOverviewParent} Main Return</div><div class="v">${mainRet}</div></div>
+        <div class="overview-kpi"><div class="k">Downstream Zones</div><div class="v">${ds.length}</div></div>
+        <div class="overview-kpi"><div class="k">Calling Now</div><div class="v">${callingCount}</div></div>
+        <div class="overview-kpi"><div class="k">Trouble</div><div class="v">${troubleCount}</div></div>
+        <div class="overview-kpi"><div class="k">Online</div><div class="v">${onlineCount}/${ds.length}</div></div>
+        <div class="overview-kpi"><div class="k">Avg Feed</div><div class="v">${avg(feedVals)}</div></div>
+        <div class="overview-kpi"><div class="k">Avg Return</div><div class="v">${avg(retVals)}</div></div>
+      `;
+
+      if (!ds.length) {
+        cardsEl.innerHTML = `<div class="smallnote">No adopted downstream devices assigned to ${activeOverviewParent} yet. Use <strong>Add Device</strong> to set up and assign the first zone.</div>`;
+        return;
+      }
+      cardsEl.innerHTML = "";
+      ds.forEach((z) => {
+        const card = document.createElement("div");
+        card.className = "overview-card";
+        const status = z.zone_status || z.status || "--";
+        const note = z.status_note || "";
+        const statusCls = statusClass(z.status);
+        card.innerHTML = `
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:start">
+            <div>
+              <div class="t">${z.name || z.id || "--"}</div>
+              <div class="s">${z.id || ""}</div>
+            </div>
+            <button type="button" class="btn" style="padding:4px 10px">Open Graph</button>
+          </div>
+          <div class="line">Call: ${z.call_status || (z.heating_call === true ? "24VAC Present (Calling)" : (z.heating_call === false ? "No 24VAC (Idle)" : "24VAC Signal Unknown"))}</div>
+          <div class="line">Feed: ${fmtTemp(z.feed_f)} · Return: ${fmtTemp(z.return_f)}</div>
+          <div class="line ${statusCls}">Status: ${status}</div>
+          ${note ? `<div class="line s">Note: ${note}</div>` : ""}
+        `;
+        const btn = card.querySelector("button");
+        if (btn) btn.addEventListener("click", () => focusZoneGraph("ds_" + (z.id || ""), z.id || ""));
+        cardsEl.appendChild(card);
+      });
+    }
+
     function renderRows(rows) {
       const body = document.getElementById("subzoneBody");
       body.innerHTML = "";
-      if (!rows || rows.length === 0) {
-        const tr = document.createElement("tr");
-        tr.innerHTML = '<td colspan="8">No downstream zones configured yet. Edit <code>/home/eamondoherty618/downstream_zones.json</code>.</td>';
-        body.appendChild(tr);
+      const visibleRows = realDownstreamRows(rows);
+      if (!visibleRows || visibleRows.length === 0) {
+        setDownstreamVisibility(false);
         return;
       }
-      for (const z of rows) {
+      setDownstreamVisibility(true);
+      for (const z of visibleRows) {
         const tr = document.createElement("tr");
         const call = z.call_status || (z.heating_call === true ? "24VAC Present (Calling)" : (z.heating_call === false ? "No 24VAC (Idle)" : "24VAC Signal Unknown"));
         tr.innerHTML = `
@@ -2052,7 +2923,7 @@ HTML = """<!doctype html>
         { id: "zone1_main", label: "Zone 1 (Main)", type: "main", key: "zone1" },
         { id: "zone2_main", label: "Zone 2 (Main)", type: "main", key: "zone2" },
       ];
-      (downstreamRows || []).forEach((z) => {
+      realDownstreamRows(downstreamRows).forEach((z) => {
         defs.push({ id: "ds_" + z.id, label: z.name || z.id, type: "downstream", zoneId: z.id });
       });
       tabDefs = defs;
@@ -2079,7 +2950,7 @@ HTML = """<!doctype html>
       const defs = [
         { id: "zone1_main", label: "Zone 1 (Main)" },
       ];
-      (downstreamRows || []).forEach((z) => {
+      realDownstreamRows(downstreamRows).forEach((z) => {
         defs.push({ id: z.id, label: z.name || z.id });
       });
       cycleZoneDefs = defs;
@@ -2100,7 +2971,7 @@ HTML = """<!doctype html>
       });
     }
 
-    function appendLivePoint(mainReadings, downstreamRows) {
+    function appendLivePoint(mainReadings, downstreamRows, mainCallZone1 = null) {
       const p = {
         ts: new Date().toISOString(),
         main: {
@@ -2108,11 +2979,12 @@ HTML = """<!doctype html>
           return_1: mainReadings.return_1 && mainReadings.return_1.temp_f !== undefined ? mainReadings.return_1.temp_f : null,
           feed_2: mainReadings.feed_2 && mainReadings.feed_2.temp_f !== undefined ? mainReadings.feed_2.temp_f : null,
           return_2: mainReadings.return_2 && mainReadings.return_2.temp_f !== undefined ? mainReadings.return_2.temp_f : null,
+          call_zone1: mainCallZone1,
         },
         downstream: {},
       };
       (downstreamRows || []).forEach((z) => {
-        p.downstream[z.id] = { feed_f: z.feed_f, return_f: z.return_f };
+        p.downstream[z.id] = { feed_f: z.feed_f, return_f: z.return_f, call: z.heating_call };
       });
       livePoints.push(p);
       if (livePoints.length > LIVE_MAX_POINTS) {
@@ -2157,6 +3029,21 @@ HTML = """<!doctype html>
       return out;
     }
 
+    function callStateFromSample(sample, tabId) {
+      if (!sample) return null;
+      if (tabId === "zone1_main") {
+        if (sample.main && Object.prototype.hasOwnProperty.call(sample.main, "call_zone1")) return sample.main.call_zone1;
+        if (Object.prototype.hasOwnProperty.call(sample, "main_call_24vac")) return sample.main_call_24vac;
+        return null;
+      }
+      if (tabId.startsWith("ds_")) {
+        const zoneId = tabId.slice(3);
+        const d = sample.downstream && sample.downstream[zoneId];
+        if (d && Object.prototype.hasOwnProperty.call(d, "call")) return d.call;
+      }
+      return null;
+    }
+
     function drawHistory(points, tabId) {
       const canvas = document.getElementById("historyChart");
       const ctx = canvas.getContext("2d");
@@ -2175,7 +3062,7 @@ HTML = """<!doctype html>
 
       const transformed = points.map((p) => {
         const s = seriesFromSample(p, tabId);
-        return { ts: p.ts, feed: s.feed, ret: s.ret };
+        return { ts: p.ts, feed: s.feed, ret: s.ret, call: callStateFromSample(p, tabId) };
       });
 
       const vals = [];
@@ -2216,6 +3103,14 @@ HTML = """<!doctype html>
       const n = transformed.length;
       const xAt = (idx) => padL + (plotW * idx / (n - 1));
       const yAt = (v) => padT + (maxV - v) * plotH / (maxV - minV);
+
+      ctx.fillStyle = "rgba(37,99,235,0.08)";
+      for (let i = 0; i < n; i++) {
+        if (transformed[i].call !== true) continue;
+        const x0 = (i === 0) ? padL : (xAt(i - 1) + xAt(i)) / 2;
+        const x1 = (i === n - 1) ? (w - padR) : (xAt(i) + xAt(i + 1)) / 2;
+        ctx.fillRect(x0, padT, Math.max(1, x1 - x0), plotH);
+      }
 
       const lines = [
         { key: "feed", color: "#0f766e" },
@@ -2369,7 +3264,7 @@ HTML = """<!doctype html>
         setZone1StatusLabel(zone1StatusFromApi || evaluateZone1Status(r, zone1CallActive));
 
         // Keep live graph moving even when /api/hub is slow.
-        appendLivePoint(r, []);
+        appendLivePoint(r, [], zone1CallActive);
         if (activeRange === "live") renderSelectedGraph();
       } catch (e) {
         // leave last values in place
@@ -2385,22 +3280,30 @@ HTML = """<!doctype html>
         const downstream = data.downstream || [];
 
         // Main readings are updated by refreshMain() so they remain visible even if hub polling is slow.
-        appendLivePoint(r, downstream);
+        appendLivePoint(r, downstream, (data.main && Object.prototype.hasOwnProperty.call(data.main, "main_call_24vac")) ? data.main.main_call_24vac : null);
         updateTabs(downstream);
         updateCycleTabs(downstream);
         renderRows(downstream);
+        renderZoneOverview();
         refreshSiteMapZoneSelect();
+        refreshCommissioningZoneSelect();
         if (activeRange === "live") renderSelectedGraph();
 
         const trouble = Number(data.trouble_count || 0);
-        const pill = document.getElementById("alertPill");
-        pill.childNodes[0].nodeValue = `Trouble Zones: ${trouble}`;
-        pill.style.borderColor = trouble > 0 ? "rgba(255,130,130,.8)" : "rgba(180,255,210,.8)";
         const unack = Number(data.unack_alert_count || 0);
-        const upill = document.getElementById("unackPill");
-        if (upill) {
-          upill.childNodes[0].nodeValue = `Alerts To Acknowledge: ${unack}`;
-          upill.style.borderColor = unack > 0 ? "rgba(255,130,130,.8)" : "rgba(180,255,210,.8)";
+        const tasks = Math.max(trouble, unack);
+        const tpill = document.getElementById("tasksPill");
+        if (tpill) {
+          tpill.childNodes[0].nodeValue = `Tasks: ${tasks} `;
+          tpill.classList.toggle("attn", (trouble > 0 || unack > 0));
+          const dot = document.getElementById("tasksPillDot");
+          if (dot) dot.textContent = (unack > 0 ? String(Math.min(99, unack)) : "!");
+          const sub = tpill.querySelector(".sub");
+          if (sub) {
+            if (unack > 0) sub.textContent = `${unack} alert${unack === 1 ? "" : "s"} need acknowledgement`;
+            else if (trouble > 0) sub.textContent = `${trouble} trouble zone${trouble === 1 ? "" : "s"} to review`;
+            else sub.textContent = "No open tasks";
+          }
         }
 
         document.getElementById("updated").textContent = "Updated: " + (data.updated_utc || new Date().toISOString());
@@ -2427,7 +3330,12 @@ HTML = """<!doctype html>
       const sel = document.getElementById("siteMapZoneSelect");
       if (!sel) return;
       const prev = sel.value;
-      const opts = siteMapZoneOptions();
+      const opts = siteMapZoneOptions().filter((o) => {
+        if (o.id === "zone1_main" || o.id === "zone2_main") return true;
+        const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+        const row = ds.find((z) => String(z.id || "") === String(o.id));
+        return row ? isAdoptedZone(row) : false;
+      });
       sel.innerHTML = "";
       opts.forEach((o) => {
         const op = document.createElement("option");
@@ -2442,6 +3350,8 @@ HTML = """<!doctype html>
     function applySiteMapStateToForm() {
       if (!siteMapConfig) return;
       document.getElementById("siteAddress").value = siteMapConfig.address || "";
+      const layerSel = document.getElementById("siteMapLayer");
+      if (layerSel) layerSel.value = siteMapConfig.map_layer || "street";
       if (siteMapConfig.center && Number.isFinite(Number(siteMapConfig.center.lat)) && Number.isFinite(Number(siteMapConfig.center.lng))) {
         document.getElementById("siteMapCenter").value = `${Number(siteMapConfig.center.lat).toFixed(5)}, ${Number(siteMapConfig.center.lng).toFixed(5)}`;
       }
@@ -2455,10 +3365,64 @@ HTML = """<!doctype html>
       const sel = document.getElementById("siteMapZoneSelect");
       return sel ? String(sel.value || "") : "";
     }
+    function isMainZoneId(zoneId) {
+      return zoneId === "zone1_main" || zoneId === "zone2_main";
+    }
+    function updateSiteMapDetailFieldMode(zoneId) {
+      const main = isMainZoneId(zoneId || selectedSiteMapZoneId());
+      const thermostatWrap = document.getElementById("siteMapThermostatWrap");
+      const valveWrap = document.getElementById("siteMapValveWrap");
+      const pumpModelWrap = document.getElementById("siteMapPumpModelWrap");
+      const pumpVoltageWrap = document.getElementById("siteMapPumpVoltageWrap");
+      const pumpSpeedModeWrap = document.getElementById("siteMapPumpSpeedModeWrap");
+      const pumpSerialWrap = document.getElementById("siteMapPumpSerialWrap");
+      const pumpServiceNotesWrap = document.getElementById("siteMapPumpServiceNotesWrap");
+      if (thermostatWrap) thermostatWrap.classList.toggle("hidden", main);
+      if (valveWrap) valveWrap.classList.toggle("hidden", main);
+      if (pumpModelWrap) pumpModelWrap.classList.toggle("hidden", !main);
+      if (pumpVoltageWrap) pumpVoltageWrap.classList.toggle("hidden", !main);
+      if (pumpSpeedModeWrap) pumpSpeedModeWrap.classList.toggle("hidden", !main);
+      if (pumpSerialWrap) pumpSerialWrap.classList.toggle("hidden", !main);
+      if (pumpServiceNotesWrap) pumpServiceNotesWrap.classList.toggle("hidden", !main);
+      const equipEl = document.getElementById("siteMapEquipType");
+      if (equipEl) {
+        equipEl.placeholder = main ? "Circulator pump / Boiler loop pump" : "Fan coil / Unit heater / Air handler coil";
+      }
+    }
 
     function getSiteMapPin(zoneId) {
       if (!zoneId || !siteMapConfig || !siteMapConfig.pins || typeof siteMapConfig.pins !== "object") return null;
       return siteMapConfig.pins[zoneId] || null;
+    }
+
+    function setSiteMapBaseLayer(layerKey) {
+      const nextKey = (layerKey === "satellite") ? "satellite" : "street";
+      siteMapActiveLayerKey = nextKey;
+      if (siteMapConfig && typeof siteMapConfig === "object") siteMapConfig.map_layer = nextKey;
+      if (siteMapMap && siteMapBaseLayers.street && siteMapBaseLayers.satellite) {
+        if (siteMapMap.hasLayer(siteMapBaseLayers.street)) siteMapMap.removeLayer(siteMapBaseLayers.street);
+        if (siteMapMap.hasLayer(siteMapBaseLayers.satellite)) siteMapMap.removeLayer(siteMapBaseLayers.satellite);
+        siteMapBaseLayers[nextKey].addTo(siteMapMap);
+      }
+      const sel = document.getElementById("siteMapLayer");
+      if (sel) sel.value = nextKey;
+    }
+
+    function renderSiteMapBuildingOutline() {
+      if (!siteMapMap || !window.L) return;
+      if (siteMapBuildingOutlineLayer) {
+        try { siteMapMap.removeLayer(siteMapBuildingOutlineLayer); } catch (e) {}
+        siteMapBuildingOutlineLayer = null;
+      }
+      const bo = siteMapConfig && siteMapConfig.building_outline;
+      if (!bo || typeof bo !== "object") return;
+      try {
+        siteMapBuildingOutlineLayer = L.geoJSON(bo, {
+          style: { color: "#0f172a", weight: 2, fillColor: "#94a3b8", fillOpacity: 0.08 }
+        }).addTo(siteMapMap);
+      } catch (e) {
+        siteMapBuildingOutlineLayer = null;
+      }
     }
 
     function setSiteMapPhotoPreview(dataUrl) {
@@ -2481,26 +3445,37 @@ HTML = """<!doctype html>
       const roomEl = document.getElementById("siteMapRoomArea");
       const thermoEl = document.getElementById("siteMapThermostatLoc");
       const valveEl = document.getElementById("siteMapValveType");
+      const pumpModelEl = document.getElementById("siteMapPumpModel");
+      const pumpVoltageEl = document.getElementById("siteMapPumpVoltage");
+      const pumpSpeedModeEl = document.getElementById("siteMapPumpSpeedMode");
+      const pumpSerialEl = document.getElementById("siteMapPumpSerial");
       const breakerEl = document.getElementById("siteMapBreakerRef");
       const installedByEl = document.getElementById("siteMapInstalledBy");
       const installDateEl = document.getElementById("siteMapInstallDate");
       const lastServiceDateEl = document.getElementById("siteMapLastServiceDate");
       const descEl = document.getElementById("siteMapDesc");
       const accessEl = document.getElementById("siteMapAccessInstructions");
+      const pumpServiceNotesEl = document.getElementById("siteMapPumpServiceNotes");
       if (colorEl) colorEl.value = pin.color || "red";
       if (equipEl) equipEl.value = pin.equipment_type || "";
       if (roomEl) roomEl.value = pin.room_area_name || "";
       if (thermoEl) thermoEl.value = pin.thermostat_location || "";
       if (valveEl) valveEl.value = pin.valve_actuator_type || "";
+      if (pumpModelEl) pumpModelEl.value = pin.pump_model || "";
+      if (pumpVoltageEl) pumpVoltageEl.value = pin.pump_voltage || "";
+      if (pumpSpeedModeEl) pumpSpeedModeEl.value = pin.pump_speed_mode || "";
+      if (pumpSerialEl) pumpSerialEl.value = pin.pump_serial || "";
       if (breakerEl) breakerEl.value = pin.circuit_breaker_ref || "";
       if (installedByEl) installedByEl.value = pin.installed_by || "";
       if (installDateEl) installDateEl.value = pin.install_date || "";
       if (lastServiceDateEl) lastServiceDateEl.value = pin.last_service_date || "";
       if (descEl) descEl.value = pin.description || "";
       if (accessEl) accessEl.value = pin.access_instructions || "";
+      if (pumpServiceNotesEl) pumpServiceNotesEl.value = pin.pump_service_notes || "";
       setSiteMapPhotoPreview(pin.photo_data_url || "");
       const photoInput = document.getElementById("siteMapPhotoInput");
       if (photoInput) photoInput.value = "";
+      updateSiteMapDetailFieldMode(zoneId);
     }
 
     function renderSiteMapPinsList() {
@@ -2523,6 +3498,52 @@ HTML = """<!doctype html>
       });
     }
 
+    function renderSiteMapZoneAreas() {
+      if (!siteMapMap || !window.L) return;
+      Object.values(siteMapZonePolygons).forEach((poly) => { try { siteMapMap.removeLayer(poly); } catch (e) {} });
+      siteMapZonePolygons = {};
+      const pins = (siteMapConfig && siteMapConfig.pins && typeof siteMapConfig.pins === "object") ? siteMapConfig.pins : {};
+      const labels = {};
+      siteMapZoneOptions().forEach((o) => { labels[o.id] = o.label; });
+      const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
+      Object.entries(pins).forEach(([zid, p]) => {
+        const polyPts = Array.isArray(p.polygon) ? p.polygon : [];
+        if (polyPts.length < 3) return;
+        const ll = polyPts
+          .map((pt) => [Number(pt.lat), Number(pt.lng)])
+          .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
+        if (ll.length < 3) return;
+        const row = ds.find((z) => String(z.id || "") === String(zid));
+        const parentColor = row ? parentZoneColorHex(row.parent_zone) : pinColorHex(p.color);
+        const fillColor = pinColorHex(p.color);
+        const poly = L.polygon(ll, {
+          color: parentColor,
+          weight: 2,
+          fillColor,
+          fillOpacity: 0.18,
+        }).addTo(siteMapMap);
+        poly.bindPopup(`<b>${labels[zid] || p.label || zid}</b><br>${p.room_area_name || p.equipment_type || "Zone area"}`);
+        poly.on("click", () => openZoneInfoModal(zid));
+        siteMapZonePolygons[zid] = poly;
+      });
+    }
+
+    function renderSiteMapDraftArea() {
+      if (!siteMapMap || !window.L) return;
+      if (siteMapDraftAreaLayer) {
+        try { siteMapMap.removeLayer(siteMapDraftAreaLayer); } catch (e) {}
+        siteMapDraftAreaLayer = null;
+      }
+      if (!siteMapDrawingArea || siteMapDraftAreaPoints.length === 0) return;
+      const latlngs = siteMapDraftAreaPoints.map((p) => [p.lat, p.lng]);
+      const color = pinColorHex(document.getElementById("siteMapPinColor")?.value || "red");
+      if (latlngs.length >= 3) {
+        siteMapDraftAreaLayer = L.polygon(latlngs, { color, weight: 2, dashArray: "6,4", fillColor: color, fillOpacity: 0.08 }).addTo(siteMapMap);
+      } else {
+        siteMapDraftAreaLayer = L.polyline(latlngs, { color, weight: 2, dashArray: "6,4" }).addTo(siteMapMap);
+      }
+    }
+
     function renderSiteMapMarkers() {
       if (!siteMapMap || !window.L) return;
       Object.values(siteMapMarkers).forEach((m) => { try { siteMapMap.removeLayer(m); } catch (e) {} });
@@ -2541,6 +3562,9 @@ HTML = """<!doctype html>
         marker.bindPopup(`<b>${labels[zid] || p.label || zid}</b>${p.equipment_type ? `<br>${p.equipment_type}` : ""}`);
         siteMapMarkers[zid] = marker;
       });
+      renderSiteMapBuildingOutline();
+      renderSiteMapZoneAreas();
+      renderSiteMapDraftArea();
       renderSiteMapPinsList();
     }
 
@@ -2561,14 +3585,25 @@ HTML = """<!doctype html>
       const base = siteMapConfig || { center: { lat: 41.307, lng: -72.927 }, zoom: 16, pins: {} };
       siteMapMap = L.map("siteMapCanvas");
       siteMapMap.setView([Number(base.center.lat), Number(base.center.lng)], Number(base.zoom || 16));
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      siteMapBaseLayers.street = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 20,
         attribution: "&copy; OpenStreetMap contributors"
-      }).addTo(siteMapMap);
+      });
+      siteMapBaseLayers.satellite = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+        maxZoom: 20,
+        attribution: "Tiles &copy; Esri"
+      });
+      setSiteMapBaseLayer((base && base.map_layer) || "street");
       siteMapMap.on("click", (e) => {
         const sel = document.getElementById("siteMapZoneSelect");
         const zoneId = sel ? sel.value : "";
         if (!zoneId) { setSiteMapMsg("Select a zone/device first."); return; }
+        if (siteMapDrawingArea) {
+          siteMapDraftAreaPoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
+          renderSiteMapDraftArea();
+          setSiteMapMsg(`Zone area point ${siteMapDraftAreaPoints.length} added. Add at least 3 points, then click Finish Area.`);
+          return;
+        }
         if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
         if (!siteMapConfig.pins || typeof siteMapConfig.pins !== "object") siteMapConfig.pins = {};
         const labels = {};
@@ -2586,9 +3621,15 @@ HTML = """<!doctype html>
           last_service_date: (getSiteMapPin(zoneId) || {}).last_service_date || "",
           thermostat_location: (getSiteMapPin(zoneId) || {}).thermostat_location || "",
           valve_actuator_type: (getSiteMapPin(zoneId) || {}).valve_actuator_type || "",
+          pump_model: (getSiteMapPin(zoneId) || {}).pump_model || "",
+          pump_voltage: (getSiteMapPin(zoneId) || {}).pump_voltage || "",
+          pump_speed_mode: (getSiteMapPin(zoneId) || {}).pump_speed_mode || "",
+          pump_serial: (getSiteMapPin(zoneId) || {}).pump_serial || "",
+          pump_service_notes: (getSiteMapPin(zoneId) || {}).pump_service_notes || "",
           circuit_breaker_ref: (getSiteMapPin(zoneId) || {}).circuit_breaker_ref || "",
           description: (getSiteMapPin(zoneId) || {}).description || "",
           photo_data_url: (getSiteMapPin(zoneId) || {}).photo_data_url || "",
+          polygon: Array.isArray((getSiteMapPin(zoneId) || {}).polygon) ? (getSiteMapPin(zoneId) || {}).polygon : [],
           updated_utc: new Date().toISOString()
         };
         snapshotSiteMapViewport();
@@ -2620,6 +3661,7 @@ HTML = """<!doctype html>
     async function saveSiteMapConfig() {
       if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
       siteMapConfig.address = document.getElementById("siteAddress").value.trim();
+      siteMapConfig.map_layer = document.getElementById("siteMapLayer")?.value || "street";
       snapshotSiteMapViewport();
       setSiteMapMsg("Saving map...");
       try {
@@ -2661,6 +3703,70 @@ HTML = """<!doctype html>
       }
     }
 
+    async function loadBuildingOutline() {
+      const q = document.getElementById("siteAddress").value.trim();
+      if (!q) { setSiteMapMsg("Enter a building address first."); return; }
+      setSiteMapMsg("Loading building outline...");
+      try {
+        const res = await fetch(`/api/building-footprint?q=${encodeURIComponent(q)}&_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "outline lookup failed");
+        if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+        siteMapConfig.building_outline = data.building_outline || null;
+        if (data.center && Number.isFinite(Number(data.center.lat)) && Number.isFinite(Number(data.center.lng))) {
+          siteMapConfig.center = { lat: Number(data.center.lat), lng: Number(data.center.lng) };
+          if (siteMapMap) siteMapMap.setView([siteMapConfig.center.lat, siteMapConfig.center.lng], Math.max(18, Number(siteMapConfig.zoom || 18)));
+        }
+        renderSiteMapMarkers();
+        setSiteMapMsg("Building outline loaded. Click Save Map to store it.");
+      } catch (e) {
+        setSiteMapMsg("Building outline lookup failed: " + e.message);
+      }
+    }
+
+    function startZoneAreaDraw() {
+      const zoneId = selectedSiteMapZoneId();
+      if (!zoneId) { setSiteMapMsg("Select a zone/device first."); return; }
+      siteMapDrawingArea = true;
+      siteMapDraftAreaPoints = [];
+      renderSiteMapDraftArea();
+      setSiteMapMsg("Zone area drawing started. Tap the map to add points, then click Finish Area.");
+    }
+
+    function cancelZoneAreaDraw() {
+      siteMapDrawingArea = false;
+      siteMapDraftAreaPoints = [];
+      renderSiteMapDraftArea();
+      setSiteMapMsg("Zone area drawing canceled.");
+    }
+
+    function finishZoneAreaDraw() {
+      const zoneId = selectedSiteMapZoneId();
+      if (!zoneId) { setSiteMapMsg("Select a zone/device first."); return; }
+      if (siteMapDraftAreaPoints.length < 3) { setSiteMapMsg("Add at least 3 points to create a zone area."); return; }
+      if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+      if (!siteMapConfig.pins || typeof siteMapConfig.pins !== "object") siteMapConfig.pins = {};
+      const pin = siteMapConfig.pins[zoneId] || { label: zoneId };
+      pin.polygon = siteMapDraftAreaPoints.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+      pin.updated_utc = new Date().toISOString();
+      siteMapConfig.pins[zoneId] = pin;
+      siteMapDrawingArea = false;
+      siteMapDraftAreaPoints = [];
+      renderSiteMapMarkers();
+      setSiteMapMsg("Zone area saved for selected zone/device. Click Save Map to store.");
+    }
+
+    function clearSelectedZoneArea() {
+      const zoneId = selectedSiteMapZoneId();
+      if (!zoneId || !siteMapConfig || !siteMapConfig.pins || !siteMapConfig.pins[zoneId]) {
+        setSiteMapMsg("No selected zone area to clear.");
+        return;
+      }
+      delete siteMapConfig.pins[zoneId].polygon;
+      renderSiteMapMarkers();
+      setSiteMapMsg("Selected zone area removed. Click Save Map to store.");
+    }
+
     function clearSelectedSiteMapPin() {
       const sel = document.getElementById("siteMapZoneSelect");
       const zoneId = sel ? sel.value : "";
@@ -2686,12 +3792,17 @@ HTML = """<!doctype html>
       pin.room_area_name = document.getElementById("siteMapRoomArea").value.trim();
       pin.thermostat_location = document.getElementById("siteMapThermostatLoc").value.trim();
       pin.valve_actuator_type = document.getElementById("siteMapValveType").value.trim();
+      pin.pump_model = (document.getElementById("siteMapPumpModel")?.value || "").trim();
+      pin.pump_voltage = (document.getElementById("siteMapPumpVoltage")?.value || "").trim();
+      pin.pump_speed_mode = (document.getElementById("siteMapPumpSpeedMode")?.value || "").trim();
+      pin.pump_serial = (document.getElementById("siteMapPumpSerial")?.value || "").trim();
       pin.circuit_breaker_ref = document.getElementById("siteMapBreakerRef").value.trim();
       pin.installed_by = document.getElementById("siteMapInstalledBy").value.trim();
       pin.install_date = document.getElementById("siteMapInstallDate").value || "";
       pin.last_service_date = document.getElementById("siteMapLastServiceDate").value || "";
       pin.description = document.getElementById("siteMapDesc").value.trim();
       pin.access_instructions = document.getElementById("siteMapAccessInstructions").value.trim();
+      pin.pump_service_notes = (document.getElementById("siteMapPumpServiceNotes")?.value || "").trim();
       const pendingPhoto = document.getElementById("siteMapPhotoPreview").src || "";
       if (pendingPhoto && pendingPhoto.startsWith("data:image/")) {
         pin.photo_data_url = pendingPhoto;
@@ -2769,12 +3880,23 @@ HTML = """<!doctype html>
       const opt = opts.find((o) => o.id === zoneId);
       const pin = getSiteMapPin(zoneId) || {};
       const live = zoneLiveInfoById(zoneId) || {};
+      const mainZone = isMainZoneId(zoneId);
       document.getElementById("zoneInfoTitle").textContent = (opt && opt.label) ? `${opt.label} Information` : "Zone Information";
       document.getElementById("zoneInfoLabel").textContent = (opt && opt.label) || pin.label || zoneId || "--";
       document.getElementById("zoneInfoRoomArea").textContent = pin.room_area_name || "Not set";
       document.getElementById("zoneInfoEquip").textContent = pin.equipment_type || "Not set";
       document.getElementById("zoneInfoThermostat").textContent = pin.thermostat_location || "Not set";
       document.getElementById("zoneInfoValve").textContent = pin.valve_actuator_type || "Not set";
+      document.getElementById("zoneInfoPumpModel").textContent = pin.pump_model || "Not set";
+      document.getElementById("zoneInfoPumpVoltage").textContent = pin.pump_voltage || "Not set";
+      document.getElementById("zoneInfoPumpSpeedMode").textContent = pin.pump_speed_mode || "Not set";
+      document.getElementById("zoneInfoPumpSerial").textContent = pin.pump_serial || "Not set";
+      document.getElementById("zoneInfoThermostatRow").classList.toggle("hidden", mainZone);
+      document.getElementById("zoneInfoValveRow").classList.toggle("hidden", mainZone);
+      document.getElementById("zoneInfoPumpModelRow").classList.toggle("hidden", !mainZone);
+      document.getElementById("zoneInfoPumpVoltageRow").classList.toggle("hidden", !mainZone);
+      document.getElementById("zoneInfoPumpSpeedModeRow").classList.toggle("hidden", !mainZone);
+      document.getElementById("zoneInfoPumpSerialRow").classList.toggle("hidden", !mainZone);
       document.getElementById("zoneInfoBreaker").textContent = pin.circuit_breaker_ref || "Not set";
       document.getElementById("zoneInfoInstalledBy").textContent = pin.installed_by || "Not set";
       document.getElementById("zoneInfoInstallDate").textContent = pin.install_date || "Not set";
@@ -2784,6 +3906,8 @@ HTML = """<!doctype html>
       document.getElementById("zoneInfoUpdated").textContent = pin.updated_utc ? String(pin.updated_utc).replace("T"," ").replace("+00:00"," UTC") : "Not set";
       document.getElementById("zoneInfoDesc").textContent = pin.description || "No location notes saved yet.";
       document.getElementById("zoneInfoAccess").textContent = pin.access_instructions || "No access instructions saved yet.";
+      document.getElementById("zoneInfoPumpServiceNotes").textContent = pin.pump_service_notes || "No pump service notes saved yet.";
+      document.getElementById("zoneInfoPumpServiceNotesWrap").classList.toggle("hidden", !mainZone);
       const img = document.getElementById("zoneInfoPhoto");
       if (pin.photo_data_url) {
         img.src = pin.photo_data_url;
@@ -2867,16 +3991,42 @@ HTML = """<!doctype html>
       const el = document.getElementById("siteMapMsg");
       if (el) el.textContent = msg || "";
     }
+    function setZoneMgmtMsg(msg) {
+      const el = document.getElementById("zoneMgmtMsg");
+      if (el) el.textContent = msg || "";
+    }
+    function setCommissionMsg(msg) {
+      const el = document.getElementById("commissionMsg");
+      if (el) el.textContent = msg || "";
+    }
+    function setBackupMsg(msg) {
+      const el = document.getElementById("backupMsg");
+      if (el) el.textContent = msg || "";
+    }
 
     function setAdminTab(which) {
+      ensureAdminToolsOpen();
       document.querySelectorAll("[data-admin-tab]").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === which));
       document.getElementById("adminUsersPanel").classList.toggle("hidden", which !== "users");
       document.getElementById("adminAlertsPanel").classList.toggle("hidden", which !== "alerts");
+      document.getElementById("adminZonesPanel").classList.toggle("hidden", which !== "zones");
+      document.getElementById("adminCommissioningPanel").classList.toggle("hidden", which !== "commissioning");
+      document.getElementById("adminBackupPanel").classList.toggle("hidden", which !== "backup");
       document.getElementById("adminMapPanel").classList.toggle("hidden", which !== "map");
       document.getElementById("adminSetupPanel").classList.toggle("hidden", which !== "setup");
+      if (which === "zones") {
+        refreshZoneMgmtSelect();
+        const sel = document.getElementById("zoneMgmtSelect");
+        if (sel && sel.value) loadZoneMgmtStatus(sel.value);
+      }
       if (which === "map") {
         ensureSiteMapReady();
         setTimeout(() => { if (siteMapMap) siteMapMap.invalidateSize(); }, 80);
+      }
+      if (which === "commissioning") {
+        refreshCommissioningZoneSelect();
+        const sel = document.getElementById("commissionZoneSelect");
+        if (sel && sel.value) loadCommissioningRecord(sel.value);
       }
     }
     function setAlertLogFilter(which) {
@@ -2894,11 +4044,15 @@ HTML = """<!doctype html>
         low_temp: "Low Temp",
         device_offline: "Device Offline",
         device_recovered: "Device Recovered",
+        hardware_fault: "Hardware Fault",
+        hardware_recovered: "Hardware Recovered",
+        probe_swap_suspected: "Probe Swap Suspected",
+        probe_swap_recovered: "Probe Swap Recovered",
       };
       return labels[cat] || cat || "--";
     }
     function isTroubleCategory(cat) {
-      return String(cat || "") !== "device_recovered";
+      return !["device_recovered", "hardware_recovered", "probe_swap_recovered"].includes(String(cat || ""));
     }
 
     function currentUserFormPayload(existingId) {
@@ -2925,8 +4079,130 @@ HTML = """<!doctype html>
     }
 
     function clearUserForm() {
-      fillUserForm({ alerts: { temp_response:true, short_cycle:true, response_lag:true, no_response:true, low_temp:true, device_offline:true, device_recovered:true }, role:"viewer", enabled:true });
+      fillUserForm({ alerts: { temp_response:true, short_cycle:true, response_lag:true, no_response:true, low_temp:true, device_offline:true, device_recovered:true, hardware_fault:true, hardware_recovered:true }, role:"viewer", enabled:true });
       document.getElementById("saveUserBtn").dataset.editingId = "";
+    }
+
+    function adoptedDownstreamRows() {
+      return realDownstreamRows((lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : []);
+    }
+
+    function refreshZoneMgmtSelect() {
+      const sel = document.getElementById("zoneMgmtSelect");
+      if (!sel) return;
+      const rows = adoptedDownstreamRows();
+      const prev = sel.value;
+      sel.innerHTML = "";
+      if (!rows.length) {
+        const op = document.createElement("option");
+        op.value = "";
+        op.textContent = "-- No adopted zone devices --";
+        sel.appendChild(op);
+        return;
+      }
+      rows.forEach((z) => {
+        const op = document.createElement("option");
+        op.value = z.id;
+        op.textContent = `${z.name || z.id} (${z.parent_zone || "--"})`;
+        sel.appendChild(op);
+      });
+      if (rows.some((z) => z.id === prev)) sel.value = prev;
+    }
+
+    function renderZoneMgmtStatus(data) {
+      zoneMgmtStatusCache = data || null;
+      const zcfg = (data && data.zone_config) || {};
+      const nodeZone = (data && data.node_zone) || {};
+      const setup = (data && data.node_setup) || {};
+      const cfg = (setup && setup.config) || {};
+      const diag = (nodeZone && nodeZone.diagnostics && typeof nodeZone.diagnostics === "object") ? nodeZone.diagnostics : {};
+      document.getElementById("zoneMgmtName").value = zcfg.name || nodeZone.unit_name || "";
+      document.getElementById("zoneMgmtParent").value = zcfg.parent_zone || cfg.parent_zone || "Zone 1";
+      document.getElementById("zoneMgmtZoneId").value = zcfg.id || cfg.zone_id || "";
+      document.getElementById("zoneMgmtLowTemp").value = (nodeZone.low_temp_threshold_f ?? ((cfg.alerts || {}).low_temp_threshold_f ?? 35));
+      document.getElementById("zoneMgmtLowTempEnabled").value = ((nodeZone.low_temp_enabled ?? ((cfg.alerts || {}).low_temp_enabled)) === false) ? "false" : "true";
+      document.getElementById("zoneMgmtProbeSwapDelta").value = ((diag.probe_swap_idle_delta_threshold_f ?? ((cfg.alerts || {}).probe_swap_idle_delta_threshold_f)) ?? 5);
+      document.getElementById("zoneMgmtProbeSummary").textContent = `Feed: ${nodeZone.feed_sensor_id || "--"} (${nodeZone.feed_f ?? "--"}F) | Return: ${nodeZone.return_sensor_id || "--"} (${nodeZone.return_f ?? "--"}F)`;
+      const diagErr = data && (data.node_zone_error || data.node_setup_error);
+      document.getElementById("zoneMgmtDiagStatus").textContent = diagErr
+        ? `Node communication issue: ${diagErr}`
+        : `${diag.self_diagnostic_status || "Unknown"}${diag.hardware_fault ? " (alerting enabled)" : ""}`;
+      const issues = Array.isArray(diag.hardware_faults) ? diag.hardware_faults : [];
+      const diagLines = issues.length ? issues.map((x) => `- ${x}`) : ["No hardware self-diagnostic issues reported."];
+      if (diag.probe_swap_suspected) {
+        diagLines.push("");
+        diagLines.push("Recommended action: Use Swap Feed / Return, then verify which pipe stays hotter during idle (no 24VAC).");
+      }
+      document.getElementById("zoneMgmtDiagIssues").textContent = diagLines.join("\\n");
+      document.getElementById("zoneMgmtFeedDiag").textContent = nodeZone.feed_error ? `Error: ${nodeZone.feed_error}` : "Reading OK";
+      document.getElementById("zoneMgmtReturnDiag").textContent = nodeZone.return_error ? `Error: ${nodeZone.return_error}` : "Reading OK";
+    }
+
+    async function loadZoneMgmtStatus(zoneId) {
+      if (!zoneId) { setZoneMgmtMsg("No adopted zone selected."); return; }
+      setZoneMgmtMsg("Loading zone diagnostics...");
+      try {
+        const res = await fetch(`/api/zone-mgmt/status?zone_id=${encodeURIComponent(zoneId)}&_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "load failed");
+        renderZoneMgmtStatus(data);
+        setZoneMgmtMsg("Zone diagnostics loaded.");
+      } catch (e) {
+        setZoneMgmtMsg("Load failed: " + e.message);
+      }
+    }
+
+    async function zoneMgmtSwapProbes() {
+      const zoneId = document.getElementById("zoneMgmtSelect").value || "";
+      if (!zoneId) { setZoneMgmtMsg("Select an adopted zone device."); return; }
+      setZoneMgmtMsg("Swapping feed/return probes on device...");
+      try {
+        const res = await fetch("/api/zone-mgmt/action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ zone_id: zoneId, action: "swap_probes" })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error || data.node_error) throw new Error(data.error || data.node_error || "swap failed");
+        setZoneMgmtMsg("Feed/return probes swapped on device.");
+        await loadZoneMgmtStatus(zoneId);
+      } catch (e) {
+        setZoneMgmtMsg("Swap failed: " + e.message);
+      }
+    }
+
+    async function zoneMgmtSave() {
+      const zoneId = document.getElementById("zoneMgmtSelect").value || "";
+      if (!zoneId) { setZoneMgmtMsg("Select an adopted zone device."); return; }
+      const body = {
+        zone_id: zoneId,
+        action: "save",
+        name: document.getElementById("zoneMgmtName").value.trim(),
+        parent_zone: document.getElementById("zoneMgmtParent").value.trim(),
+        unit_name: document.getElementById("zoneMgmtName").value.trim(),
+        alerts: {
+          low_temp_enabled: document.getElementById("zoneMgmtLowTempEnabled").value === "true",
+          low_temp_threshold_f: Number(document.getElementById("zoneMgmtLowTemp").value || 35),
+          probe_swap_idle_delta_threshold_f: Number(document.getElementById("zoneMgmtProbeSwapDelta").value || 5)
+        }
+      };
+      setZoneMgmtMsg("Saving zone changes...");
+      try {
+        const res = await fetch("/api/zone-mgmt/action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || data.node_error || "save failed");
+        if (data.node_error) setZoneMgmtMsg("Saved hub config, but node update had an issue: " + data.node_error);
+        else setZoneMgmtMsg("Zone changes saved.");
+        await refreshHub();
+        refreshZoneMgmtSelect();
+        await loadZoneMgmtStatus(zoneId);
+      } catch (e) {
+        setZoneMgmtMsg("Save failed: " + e.message);
+      }
     }
 
     function renderUsers(users) {
@@ -3009,16 +4285,60 @@ HTML = """<!doctype html>
       }
     }
 
-    function renderAlertEvents(events) {
-      alertEventsCache = Array.isArray(events) ? events : [];
-      const body = document.getElementById("alertsBody");
-      body.innerHTML = "";
+    function filteredAlertEventsForActiveView() {
       let arr = alertEventsCache.slice();
       if (activeAlertLogFilter === "trouble") {
         arr = arr.filter((ev) => isTroubleCategory(ev.category));
       } else if (activeAlertLogFilter === "unack") {
         arr = arr.filter((ev) => !ev.acknowledged);
       }
+      return arr;
+    }
+
+    async function acknowledgeAlertEvent(ev, useCurrentNote=true) {
+      if (!ev || !ev.id) return;
+      const who = document.getElementById("ackBy").value.trim();
+      const note = useCurrentNote ? document.getElementById("ackNote").value.trim() : "";
+      setAlertsMsg("Acknowledging alert...");
+      const res = await fetch("/api/alerts/ack", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ id: ev.id, who, note })
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || data.ok === false) {
+        setAlertsMsg("Acknowledge failed: " + (data.error || data.message || "unknown"));
+        return false;
+      }
+      renderAlertEvents(data.events || []);
+      setAlertsMsg("Alert acknowledged.");
+      return true;
+    }
+
+    async function acknowledgeAllVisibleAlerts() {
+      const visible = filteredAlertEventsForActiveView().filter((ev) => !ev.acknowledged);
+      if (!visible.length) {
+        setAlertsMsg("No unacknowledged alerts in this view.");
+        return;
+      }
+      if (!confirm(`Acknowledge ${visible.length} visible alert(s)?`)) return;
+      let okCount = 0;
+      for (const ev of visible) {
+        try {
+          const ok = await acknowledgeAlertEvent(ev, true);
+          if (ok) okCount += 1;
+        } catch (_) {}
+      }
+      setAlertsMsg(`Acknowledged ${okCount} alert(s).`);
+      await loadAlertEvents();
+      await refreshHub();
+    }
+
+    function renderAlertEvents(events) {
+      alertEventsCache = Array.isArray(events) ? events : [];
+      const body = document.getElementById("alertsBody");
+      body.innerHTML = "";
+      let arr = filteredAlertEventsForActiveView();
       if (!arr.length) {
         body.innerHTML = '<tr><td colspan="6">No alerts in this view.</td></tr>';
         return;
@@ -3036,29 +4356,27 @@ HTML = """<!doctype html>
         `;
         const td = tr.lastElementChild;
         if (!ev.acknowledged) {
-          const b = document.createElement("button");
-          b.type = "button";
-          b.className = "btn";
-          b.style.padding = "4px 10px";
-          b.textContent = "Acknowledge";
-          b.addEventListener("click", async () => {
-            const who = document.getElementById("ackBy").value.trim();
-            const note = document.getElementById("ackNote").value.trim();
-            setAlertsMsg("Acknowledging alert...");
-            const res = await fetch("/api/alerts/ack", {
-              method:"POST",
-              headers:{ "Content-Type":"application/json" },
-              body: JSON.stringify({ id: ev.id, who, note })
-            });
-            const data = await res.json();
-            if (!res.ok || data.error || data.ok === false) {
-              setAlertsMsg("Acknowledge failed: " + (data.error || data.message || "unknown"));
-              return;
-            }
-            renderAlertEvents(data.events || []);
-            setAlertsMsg("Alert acknowledged.");
+          const quickBtn = document.createElement("button");
+          quickBtn.type = "button";
+          quickBtn.className = "btn";
+          quickBtn.style.padding = "4px 10px";
+          quickBtn.textContent = "Quick Ack";
+          quickBtn.addEventListener("click", async () => {
+            await acknowledgeAlertEvent(ev, false);
+            await refreshHub();
           });
-          td.appendChild(b);
+          td.appendChild(quickBtn);
+          const noteBtn = document.createElement("button");
+          noteBtn.type = "button";
+          noteBtn.className = "btn";
+          noteBtn.style.padding = "4px 10px";
+          noteBtn.style.marginLeft = "6px";
+          noteBtn.textContent = "Ack + Note";
+          noteBtn.addEventListener("click", async () => {
+            await acknowledgeAlertEvent(ev, true);
+            await refreshHub();
+          });
+          td.appendChild(noteBtn);
         } else {
           td.textContent = "—";
         }
@@ -3081,7 +4399,6 @@ HTML = """<!doctype html>
         const res = await fetch(`/api/notifications?_=${Date.now()}`, { cache: "no-store" });
         const data = await res.json();
         const email = data.email || {};
-        document.getElementById("notifEmails").value = Array.isArray(email.to) ? email.to.join(", ") : (email.to || "");
         document.getElementById("notifCooldown").value = Number(data.cooldown_minutes || 120);
         document.getElementById("notifEmailEnabled").value = email.enabled ? "true" : "false";
       } catch (e) {
@@ -3090,10 +4407,6 @@ HTML = """<!doctype html>
     }
 
     async function saveNotifications() {
-      const emails = document.getElementById("notifEmails").value
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
       const cooldown = Number(document.getElementById("notifCooldown").value || 120);
       const emailEnabled = document.getElementById("notifEmailEnabled").value === "true";
       setNotifMsg("Saving notification settings...");
@@ -3103,7 +4416,7 @@ HTML = """<!doctype html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             cooldown_minutes: cooldown,
-            email: { enabled: emailEnabled, to: emails }
+            email: { enabled: emailEnabled }
           })
         });
         const data = await res.json();
@@ -3149,23 +4462,57 @@ HTML = """<!doctype html>
     function openAlertPanelWithFilter(filterName) {
       setAdminTab("alerts");
       setAlertLogFilter(filterName);
-      const panel = document.getElementById("adminAlertsPanel");
-      if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      scrollToAdminPanel("adminAlertsPanel");
       loadAlertEvents();
     }
+    function closeTasksMenu() {
+      const menu = document.getElementById("tasksMenu");
+      const btn = document.getElementById("tasksPill");
+      if (menu) menu.classList.remove("show");
+      if (btn) btn.setAttribute("aria-expanded", "false");
+    }
+    function toggleTasksMenu() {
+      const menu = document.getElementById("tasksMenu");
+      const btn = document.getElementById("tasksPill");
+      if (!menu || !btn) return;
+      const show = !menu.classList.contains("show");
+      menu.classList.toggle("show", show);
+      btn.setAttribute("aria-expanded", show ? "true" : "false");
+    }
     function initHeaderActions() {
-      const troubleBtn = document.getElementById("alertPill");
-      const unackBtn = document.getElementById("unackPill");
+      const tasksBtn = document.getElementById("tasksPill");
       const addDeviceBtn = document.getElementById("addDevicePill");
-      if (troubleBtn) troubleBtn.addEventListener("click", () => openAlertPanelWithFilter("trouble"));
-      if (unackBtn) unackBtn.addEventListener("click", () => openAlertPanelWithFilter("unack"));
-      if (addDeviceBtn) {
-        addDeviceBtn.addEventListener("click", () => {
-          setAdminTab("setup");
-          const panel = document.getElementById("adminSetupPanel");
-          if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-      }
+      if (tasksBtn) tasksBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleTasksMenu();
+      });
+      const menuUnack = document.getElementById("tasksMenuUnack");
+      const menuAckAll = document.getElementById("tasksMenuAckAll");
+      const menuTrouble = document.getElementById("tasksMenuTrouble");
+      const menuAll = document.getElementById("tasksMenuAll");
+      if (menuUnack) menuUnack.addEventListener("click", () => { closeTasksMenu(); openAlertPanelWithFilter("unack"); });
+      if (menuAckAll) menuAckAll.addEventListener("click", async () => {
+        closeTasksMenu();
+        setAdminTab("alerts");
+        setAlertLogFilter("unack");
+        scrollToAdminPanel("adminAlertsPanel");
+        await loadAlertEvents();
+        await acknowledgeAllVisibleAlerts();
+      });
+      if (menuTrouble) menuTrouble.addEventListener("click", () => { closeTasksMenu(); openAlertPanelWithFilter("trouble"); });
+      if (menuAll) menuAll.addEventListener("click", () => { closeTasksMenu(); openAlertPanelWithFilter("all"); });
+      document.addEventListener("click", (e) => {
+        const wrap = document.querySelector(".head-action-wrap");
+        if (!wrap) return;
+        if (!wrap.contains(e.target)) closeTasksMenu();
+      });
+      if (addDeviceBtn) addDeviceBtn.addEventListener("click", openSetupPanel);
+    }
+    function initOverviewTabs() {
+      document.querySelectorAll("[data-overview-parent]").forEach((btn) => {
+        btn.addEventListener("click", () => setOverviewParent(btn.dataset.overviewParent || "Zone 1"));
+      });
     }
 
     initButtons();
@@ -3175,14 +4522,23 @@ HTML = """<!doctype html>
     initAdminTabs();
     initAlertLogFilters();
     initHeaderActions();
+    initOverviewTabs();
     bindZoneInfoButtons();
+    const firstZoneBtn = document.getElementById("firstZoneSetupBtn");
+    if (firstZoneBtn) firstZoneBtn.addEventListener("click", openSetupPanel);
     document.getElementById("siteMapFindBtn").addEventListener("click", geocodeSiteAddress);
+    document.getElementById("siteMapFootprintBtn").addEventListener("click", loadBuildingOutline);
     document.getElementById("siteMapSaveBtn").addEventListener("click", saveSiteMapConfig);
     document.getElementById("siteMapClearPinBtn").addEventListener("click", clearSelectedSiteMapPin);
+    document.getElementById("siteMapStartAreaBtn").addEventListener("click", startZoneAreaDraw);
+    document.getElementById("siteMapFinishAreaBtn").addEventListener("click", finishZoneAreaDraw);
+    document.getElementById("siteMapCancelAreaBtn").addEventListener("click", cancelZoneAreaDraw);
+    document.getElementById("siteMapClearAreaBtn").addEventListener("click", clearSelectedZoneArea);
     document.getElementById("siteMapApplyDetailsBtn").addEventListener("click", applySelectedSiteMapDetails);
     document.getElementById("siteMapClearPhotoBtn").addEventListener("click", clearSelectedSiteMapPhoto);
     document.getElementById("siteMapPhotoInput").addEventListener("change", handleSiteMapPhotoInput);
     document.getElementById("siteMapZoneSelect").addEventListener("change", syncSiteMapDetailsFormFromSelected);
+    document.getElementById("siteMapLayer").addEventListener("change", (e) => setSiteMapBaseLayer((e && e.target && e.target.value) || "street"));
     document.getElementById("siteMapZoom").addEventListener("change", () => {
       const z = Number(document.getElementById("siteMapZoom").value || 16);
       if (siteMapMap && Number.isFinite(z)) siteMapMap.setZoom(Math.max(1, Math.min(22, z)));
@@ -3193,14 +4549,42 @@ HTML = """<!doctype html>
     });
     document.getElementById("saveNotifBtn").addEventListener("click", saveNotifications);
     document.getElementById("testNotifBtn").addEventListener("click", testNotifications);
+    document.getElementById("openUsersFromNotifBtn").addEventListener("click", openUsersPanel);
     document.getElementById("saveUserBtn").addEventListener("click", saveUser);
     document.getElementById("clearUserFormBtn").addEventListener("click", clearUserForm);
     document.getElementById("refreshAlertsBtn").addEventListener("click", loadAlertEvents);
+    document.getElementById("ackAllVisibleBtn").addEventListener("click", acknowledgeAllVisibleAlerts);
     document.getElementById("alertLimit").addEventListener("change", loadAlertEvents);
+    document.getElementById("zoneMgmtSelect").addEventListener("change", (e) => {
+      const zid = (e && e.target && e.target.value) ? e.target.value : "";
+      if (zid) loadZoneMgmtStatus(zid);
+      else setZoneMgmtMsg("No adopted zone selected.");
+    });
+    document.getElementById("zoneMgmtRefreshBtn").addEventListener("click", () => {
+      const zid = document.getElementById("zoneMgmtSelect").value || "";
+      if (!zid) { setZoneMgmtMsg("No adopted zone selected."); return; }
+      loadZoneMgmtStatus(zid);
+    });
+    document.getElementById("zoneMgmtSwapBtn").addEventListener("click", zoneMgmtSwapProbes);
+    document.getElementById("zoneMgmtSaveBtn").addEventListener("click", zoneMgmtSave);
+    document.getElementById("commissionZoneSelect").addEventListener("change", (e) => {
+      const zid = (e && e.target && e.target.value) ? e.target.value : "";
+      loadCommissioningRecord(zid);
+    });
+    document.getElementById("commissionRefreshBtn").addEventListener("click", () => {
+      const zid = document.getElementById("commissionZoneSelect").value || "";
+      loadCommissioningRecord(zid);
+    });
+    document.querySelectorAll("[data-commission-check]").forEach((cb) => cb.addEventListener("change", updateCommissioningSummary));
+    document.getElementById("commissionSaveBtn").addEventListener("click", saveCommissioningRecord);
+    document.getElementById("backupExportBtn").addEventListener("click", exportBackupJson);
+    document.getElementById("backupRestoreBtn").addEventListener("click", restoreBackupJson);
     clearUserForm();
+    updateCommissioningSummary();
     setAlertLogFilter("trouble");
     refreshMain();
     refreshHub();
+    renderZoneOverview();
     refreshHistory();
     refreshCycles();
     loadNotifications();
@@ -3314,12 +4698,84 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b)
             return
 
+        if route == "/api/commissioning":
+            zone_id = str(query.get("zone_id", [""])[0]).strip()
+            cfg = load_commissioning_config()
+            records = cfg.get("records", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(records, dict):
+                records = {}
+            payload = {
+                "record": records.get(zone_id, {}) if zone_id else {},
+                "records": records if not zone_id else None,
+                "updated_utc": now_utc_iso(),
+            }
+            b = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/backup/export":
+            b = json.dumps(backup_export_bundle()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
         if route == "/api/alerts/events":
             try:
                 limit = int(query.get("limit", ["100"])[0])
             except Exception:
                 limit = 100
             b = json.dumps({"events": recent_alert_events(limit=limit), "updated_utc": now_utc_iso()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/zone-mgmt/status":
+            zone_id = str(query.get("zone_id", [""])[0]).strip()
+            if not zone_id:
+                b = json.dumps({"error": "zone_id required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            zcfg = zone_config_entry(zone_id)
+            if not zcfg:
+                b = json.dumps({"error": "zone not found"}).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            base = str(zcfg.get("source_url") or "").replace("/api/zone", "").rstrip("/")
+            node_zone, node_zone_err = (None, "no source_url")
+            node_setup, node_setup_err = (None, "no source_url")
+            if base:
+                node_zone, node_zone_err = fetch_remote_json(base + "/api/zone")
+                node_setup, node_setup_err = fetch_remote_json(base + "/api/setup-state")
+            b = json.dumps({
+                "zone_config": zcfg,
+                "node_base_url": base,
+                "node_zone": node_zone,
+                "node_zone_error": node_zone_err,
+                "node_setup": node_setup,
+                "node_setup_error": node_setup_err,
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -3385,6 +4841,72 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.write(b)
                 return
 
+        if route == "/api/building-footprint":
+            q = str(query.get("q", [""])[0]).strip()
+            if not q:
+                b = json.dumps({"error": "q required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            try:
+                url = "https://nominatim.openstreetmap.org/search?" + urlencode({
+                    "q": q,
+                    "format": "jsonv2",
+                    "limit": 3,
+                    "polygon_geojson": 1,
+                })
+                req = Request(url, headers={"User-Agent": "165-water-street-heating-hub/1.0"})
+                with urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8")
+                parsed_results = json.loads(raw)
+                picked = None
+                if isinstance(parsed_results, list):
+                    for r in parsed_results:
+                        if not isinstance(r, dict):
+                            continue
+                        gj = r.get("geojson")
+                        if isinstance(gj, dict) and gj.get("type") in ("Polygon", "MultiPolygon"):
+                            picked = {
+                                "display_name": str(r.get("display_name") or ""),
+                                "lat": r.get("lat"),
+                                "lng": r.get("lon"),
+                                "geojson": gj,
+                            }
+                            break
+                if not picked:
+                    b = json.dumps({"error": "no building outline found", "building_outline": None}).encode("utf-8")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
+                b = json.dumps({
+                    "query": q,
+                    "building_outline": picked.get("geojson"),
+                    "display_name": picked.get("display_name"),
+                    "center": {"lat": picked.get("lat"), "lng": picked.get("lng")},
+                    "updated_utc": now_utc_iso(),
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            except Exception as e:
+                b = json.dumps({"error": f"footprint lookup failed: {e}"}).encode("utf-8")
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+
         self.send_response(404)
         self.end_headers()
 
@@ -3399,6 +4921,9 @@ class H(BaseHTTPRequestHandler):
             "/api/users/delete",
             "/api/alerts/ack",
             "/api/site-map",
+            "/api/zone-mgmt/action",
+            "/api/commissioning/save",
+            "/api/backup/restore",
         ):
             self.send_response(404)
             self.end_headers()
@@ -3523,6 +5048,84 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b)
             return
 
+        if route == "/api/commissioning/save":
+            zone_id = str(body.get("zone_id") or "").strip()
+            if not zone_id:
+                b = json.dumps({"error": "zone_id is required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            cfg = load_commissioning_config()
+            records = cfg.get("records", {}) if isinstance(cfg.get("records"), dict) else {}
+            rec = records.get(zone_id, {}) if isinstance(records.get(zone_id, {}), dict) else {}
+            checks_in = body.get("checks", {}) if isinstance(body.get("checks"), dict) else {}
+            check_keys = (
+                "call_input_verified",
+                "feed_return_confirmed",
+                "temp_response_verified",
+                "photo_added",
+                "pin_placed",
+                "alert_test_completed",
+            )
+            checks = {k: bool(checks_in.get(k, False)) for k in check_keys}
+            all_done = all(checks.values()) if checks else False
+            completed_utc = str(rec.get("completed_utc") or "")
+            if all_done and not completed_utc:
+                completed_utc = now_utc_iso()
+            if not all_done:
+                completed_utc = ""
+            updated_rec = {
+                "checks": checks,
+                "notes": str(body.get("notes") or ""),
+                "completed_by": str(body.get("completed_by") or ""),
+                "completed_utc": completed_utc,
+                "updated_utc": now_utc_iso(),
+            }
+            records[zone_id] = updated_rec
+            cfg["records"] = records
+            cfg["updated_utc"] = now_utc_iso()
+            if not save_commissioning_config(cfg):
+                b = json.dumps({"error": "failed to save commissioning checklist"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            b = json.dumps({
+                "ok": True,
+                "message": "Commissioning checklist saved.",
+                "zone_id": zone_id,
+                "record": updated_rec,
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/backup/restore":
+            ok, msg = restore_from_backup_bundle(body)
+            if ok:
+                try:
+                    refresh_downstream_cache()
+                except Exception:
+                    pass
+            b = json.dumps({"ok": ok, "message": msg, "updated_utc": now_utc_iso()}).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
         if route == "/api/alerts/ack":
             event_id = str(body.get("id") or "").strip()
             who = str(body.get("who") or "").strip()
@@ -3542,6 +5145,12 @@ class H(BaseHTTPRequestHandler):
             cfg = load_site_map_config()
             if isinstance(body, dict):
                 cfg["address"] = str(body.get("address") or cfg.get("address") or "")
+                cfg["map_layer"] = str(body.get("map_layer") or cfg.get("map_layer") or "street")
+                bo = body.get("building_outline")
+                if bo is None:
+                    cfg["building_outline"] = None
+                elif isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
+                    cfg["building_outline"] = bo
                 c = body.get("center", {})
                 if isinstance(c, dict):
                     try:
@@ -3576,11 +5185,28 @@ class H(BaseHTTPRequestHandler):
                             "last_service_date": str(p.get("last_service_date") or ""),
                             "thermostat_location": str(p.get("thermostat_location") or ""),
                             "valve_actuator_type": str(p.get("valve_actuator_type") or ""),
+                            "pump_model": str(p.get("pump_model") or ""),
+                            "pump_voltage": str(p.get("pump_voltage") or ""),
+                            "pump_speed_mode": str(p.get("pump_speed_mode") or ""),
+                            "pump_serial": str(p.get("pump_serial") or ""),
+                            "pump_service_notes": str(p.get("pump_service_notes") or ""),
                             "circuit_breaker_ref": str(p.get("circuit_breaker_ref") or ""),
                             "description": str(p.get("description") or ""),
                             "photo_data_url": str(p.get("photo_data_url") or ""),
+                            "polygon": [],
                             "updated_utc": str(p.get("updated_utc") or now_utc_iso()),
                         }
+                        poly = p.get("polygon")
+                        if isinstance(poly, list):
+                            norm_poly = []
+                            for pt in poly:
+                                if not isinstance(pt, dict):
+                                    continue
+                                try:
+                                    norm_poly.append({"lat": float(pt.get("lat")), "lng": float(pt.get("lng"))})
+                                except Exception:
+                                    continue
+                            pins_out[str(zid)]["polygon"] = norm_poly
                     cfg["pins"] = pins_out
             if not save_site_map_config(cfg):
                 b = json.dumps({"error": "failed to save site map"}).encode("utf-8")
@@ -3592,6 +5218,90 @@ class H(BaseHTTPRequestHandler):
                 return
             b = json.dumps(load_site_map_config()).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/zone-mgmt/action":
+            zone_id = str(body.get("zone_id") or "").strip()
+            action = str(body.get("action") or "").strip()
+            if not zone_id or not action:
+                b = json.dumps({"error": "zone_id and action required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            zones = load_config()
+            zcfg = None
+            zidx = None
+            for i, z in enumerate(zones):
+                if isinstance(z, dict) and str(z.get("id") or "").strip() == zone_id:
+                    zcfg = dict(z); zidx = i; break
+            if zcfg is None:
+                b = json.dumps({"error": "zone not found"}).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            base = str(zcfg.get("source_url") or "").replace("/api/zone", "").rstrip("/")
+            node_result = None
+            node_error = None
+            if action == "swap_probes":
+                if not base:
+                    node_error = "zone has no source_url"
+                else:
+                    node_result, node_error = post_remote_json(base + "/api/manage/swap-probes", {})
+            elif action == "save":
+                # Update hub-side display/config first.
+                for k in ("name", "parent_zone"):
+                    if k in body:
+                        zcfg[k] = str(body.get(k) or "").strip()
+                if "delta_ok_f" in body:
+                    try:
+                        zcfg["delta_ok_f"] = float(body.get("delta_ok_f"))
+                    except Exception:
+                        pass
+                if zidx is not None:
+                    zones[zidx] = zcfg
+                    if not save_config_zones(zones):
+                        node_error = "failed to save hub zone config"
+                # Then push editable device settings to node (if reachable).
+                if base:
+                    node_payload = {
+                        "unit_name": body.get("unit_name"),
+                        "zone_id": body.get("zone_id"),
+                        "parent_zone": body.get("parent_zone"),
+                    }
+                    if isinstance(body.get("alerts"), dict):
+                        node_payload["alerts"] = body.get("alerts")
+                    node_result, post_err = post_remote_json(base + "/api/manage/update", node_payload)
+                    if post_err:
+                        node_error = (node_error + "; " if node_error else "") + post_err
+                else:
+                    node_error = (node_error + "; " if node_error else "") + "zone has no source_url"
+            else:
+                b = json.dumps({"error": "unsupported action"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            b = json.dumps({
+                "ok": node_error is None,
+                "zone_config": zcfg,
+                "node_result": node_result,
+                "node_error": node_error,
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
+            self.send_response(200 if node_error is None else 502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(b)))
