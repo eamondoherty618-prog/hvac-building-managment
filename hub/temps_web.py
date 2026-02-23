@@ -31,7 +31,9 @@ ZONE1_DELTA_THRESHOLD_F = 10.0
 ALERT_CONFIG_PATH = Path("/home/eamondoherty618/alert_config.json")
 ALERT_LOG_PATH = Path("/home/eamondoherty618/alert_events.log")
 DEFAULT_ALERT_COOLDOWN_MIN = 120
+ZONE1_CALL_ALERT_GRACE_SECONDS = 120
 PUBLIC_HUB_URL = "https://165-boiler.tail58e171.ts.net/"
+HUB_SITE_NAME = "165 Water Street Heating Hub"
 
 DEFAULT_CONFIG = {
     "zones": [
@@ -68,6 +70,9 @@ downstream_cache_updated_utc = None
 local_cache_lock = threading.Lock()
 local_cache = None
 local_cache_updated_utc = None
+main_call_state_lock = threading.Lock()
+main_call_prev_active = None
+main_call_active_since_utc = None
 
 main_call_input = None
 if Button is not None:
@@ -92,6 +97,33 @@ def load_alert_config():
         return json.loads(ALERT_CONFIG_PATH.read_text())
     except Exception:
         return {}
+
+
+def save_alert_config(cfg):
+    try:
+        ALERT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ALERT_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def public_notifications_config():
+    cfg = load_alert_config()
+    email_cfg = cfg.get("email", {}) if isinstance(cfg, dict) else {}
+    return {
+        "updated_utc": now_utc_iso(),
+        "cooldown_minutes": cfg.get("cooldown_minutes", DEFAULT_ALERT_COOLDOWN_MIN) if isinstance(cfg, dict) else DEFAULT_ALERT_COOLDOWN_MIN,
+        "email": {
+            "enabled": bool(email_cfg.get("enabled")),
+            "to": email_cfg.get("to", []),
+            "from": email_cfg.get("from", email_cfg.get("username", "")),
+            "smtp_host": email_cfg.get("smtp_host", ""),
+            "smtp_port": email_cfg.get("smtp_port", 587),
+            "username": email_cfg.get("username", ""),
+            "has_password": bool(email_cfg.get("password")),
+        },
+    }
 
 
 def log_alert_event(msg):
@@ -196,6 +228,29 @@ def evaluate_zone1_main_status(readings, call_active, threshold_f=ZONE1_DELTA_TH
     return "Signal Unknown", "24VAC signal unavailable", False
 
 
+def update_main_call_timing(call_active):
+    global main_call_prev_active, main_call_active_since_utc
+    now = now_utc()
+    with main_call_state_lock:
+        if call_active is True:
+            if main_call_prev_active is not True:
+                main_call_active_since_utc = now
+        else:
+            main_call_active_since_utc = None
+        main_call_prev_active = call_active
+
+
+def zone1_call_grace_remaining_seconds(call_active):
+    if call_active is not True:
+        return 0
+    with main_call_state_lock:
+        started = main_call_active_since_utc
+    if started is None:
+        return ZONE1_CALL_ALERT_GRACE_SECONDS
+    elapsed = (now_utc() - started).total_seconds()
+    return max(0, int(ZONE1_CALL_ALERT_GRACE_SECONDS - elapsed))
+
+
 def zone1_alert_fault_key(zone1_status, detail):
     if zone1_status != "Notify Admin":
         return zone1_status
@@ -207,10 +262,17 @@ def zone1_alert_fault_key(zone1_status, detail):
     return "Notify Admin:generic"
 
 
-def maybe_send_admin_alert(zone1_status, detail, readings, call_status):
+def maybe_send_admin_alert(zone1_status, detail, readings, call_status, call_active=None):
     global last_alert_sent_at, last_alert_key
 
     if zone1_status != "Notify Admin":
+        return
+
+    grace_remaining = zone1_call_grace_remaining_seconds(call_active)
+    if call_active is True and grace_remaining > 0:
+        log_alert_event(
+            f"alert_suppressed grace_period remaining_sec={grace_remaining} status={zone1_status} detail={detail}"
+        )
         return
 
     cfg = load_alert_config()
@@ -310,6 +372,7 @@ def local_payload():
             "error": e,
         }
     call_active, call_status = main_call_state()
+    update_main_call_timing(call_active)
     zone1_status_label, zone1_status_detail, _ = evaluate_zone1_main_status(out, call_active)
     return {"readings": out, "main_call_24vac": call_active, "main_call_status": call_status, "zone1_status_label": zone1_status_label, "zone1_status_detail": zone1_status_detail, "zone1_delta_threshold_f": ZONE1_DELTA_THRESHOLD_F, "updated_utc": now_utc_iso()}
 
@@ -322,9 +385,10 @@ def trigger_zone1_alert_from_local(local):
         detail = local.get("zone1_status_detail")
         readings = local.get("readings", {})
         call_status = local.get("main_call_status")
+        call_active = local.get("main_call_24vac")
         t = threading.Thread(
             target=maybe_send_admin_alert,
-            args=(status, detail, readings, call_status),
+            args=(status, detail, readings, call_status, call_active),
             daemon=True,
         )
         t.start()
@@ -675,10 +739,17 @@ HTML = """<!doctype html>
     .st-trouble { color:var(--bad); }
 
     .status-chip{display:inline-flex;align-items:center;gap:.4rem;padding:.2rem .55rem;border-radius:999px;background:#f3f8fb;border:1px solid var(--border)}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .form-grid .full{grid-column:1 / -1}
+    .input,.select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fff}
+    .input:focus,.select:focus{outline:none;border-color:#8bc2d3;box-shadow:0 0 0 4px rgba(22,138,173,.12)}
+    .smallnote{font-size:.82rem;color:var(--muted)}
+    .msg{margin-top:8px;font-weight:700;color:#114b5f;white-space:pre-wrap}
     @media (max-width:760px) {
       .wrap { padding:.75rem; }
       .head { padding:14px; border-radius:14px; }
       .temp { font-size:1.35rem; }
+      .form-grid{grid-template-columns:1fr}
       table,thead,tbody,th,td,tr { display:block; }
       thead { display:none; }
       tr { border-bottom:1px solid var(--border); padding:8px 10px; }
@@ -746,6 +817,36 @@ HTML = """<!doctype html>
         <tbody id=\"subzoneBody\"></tbody>
       </table>
       </div>
+    </section>
+
+    <section class=\"chart-wrap\">
+      <div class=\"chart-head\">
+        <h3>Notifications / Account</h3>
+        <div class=\"smallnote\">Configure alert recipients on the hub (shared by all zone devices)</div>
+      </div>
+      <form id=\"notifForm\" class=\"form-grid\" style=\"margin-top:10px\">
+        <div class=\"full\">
+          <label class=\"label\" for=\"notifEmails\">Alert Email Recipients</label>
+          <input id=\"notifEmails\" class=\"input\" placeholder=\"eamon@easternstandard.co, manager@example.com\">
+          <div class=\"smallnote\">Comma-separated email addresses</div>
+        </div>
+        <div>
+          <label class=\"label\" for=\"notifCooldown\">Repeat Alert Cooldown (minutes)</label>
+          <input id=\"notifCooldown\" class=\"input\" type=\"number\" min=\"1\" step=\"1\" value=\"120\">
+        </div>
+        <div>
+          <label class=\"label\" for=\"notifEmailEnabled\">Email Alerts</label>
+          <select id=\"notifEmailEnabled\" class=\"select\">
+            <option value=\"true\">Enabled</option>
+            <option value=\"false\">Disabled</option>
+          </select>
+        </div>
+        <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+          <button type=\"button\" class=\"btn active\" id=\"saveNotifBtn\">Save Notification Settings</button>
+          <button type=\"button\" class=\"btn\" id=\"testNotifBtn\">Send Test Email</button>
+        </div>
+      </form>
+      <div id=\"notifMsg\" class=\"msg\"></div>
     </section>
   </div>
 
@@ -1083,10 +1184,69 @@ HTML = """<!doctype html>
       });
     }
 
+    function setNotifMsg(msg) {
+      const el = document.getElementById("notifMsg");
+      if (el) el.textContent = msg || "";
+    }
+
+    async function loadNotifications() {
+      try {
+        const res = await fetch(`/api/notifications?_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        const email = data.email || {};
+        document.getElementById("notifEmails").value = Array.isArray(email.to) ? email.to.join(", ") : (email.to || "");
+        document.getElementById("notifCooldown").value = Number(data.cooldown_minutes || 120);
+        document.getElementById("notifEmailEnabled").value = email.enabled ? "true" : "false";
+      } catch (e) {
+        setNotifMsg("Failed to load notification settings.");
+      }
+    }
+
+    async function saveNotifications() {
+      const emails = document.getElementById("notifEmails").value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const cooldown = Number(document.getElementById("notifCooldown").value || 120);
+      const emailEnabled = document.getElementById("notifEmailEnabled").value === "true";
+      setNotifMsg("Saving notification settings...");
+      try {
+        const res = await fetch("/api/notifications", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cooldown_minutes: cooldown,
+            email: { enabled: emailEnabled, to: emails }
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "save failed");
+        setNotifMsg("Notification settings saved.");
+        await loadNotifications();
+      } catch (e) {
+        setNotifMsg("Save failed: " + e.message);
+      }
+    }
+
+    async function testNotifications() {
+      setNotifMsg("Sending test email...");
+      try {
+        const res = await fetch("/api/notifications/test-email", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "test failed");
+        setNotifMsg(data.message || "Test email sent.");
+      } catch (e) {
+        setNotifMsg("Test email failed: " + e.message);
+      }
+    }
+
     initButtons();
+    document.getElementById("saveNotifBtn").addEventListener("click", saveNotifications);
+    document.getElementById("testNotifBtn").addEventListener("click", testNotifications);
     refreshMain();
     refreshHub();
     refreshHistory();
+    loadNotifications();
     setInterval(refreshMain, 3000);
     setInterval(refreshHub, 10000);
     setInterval(refreshHistory, 60000);
@@ -1143,8 +1303,123 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b)
             return
 
+        if route == "/api/notifications":
+            b = json.dumps(public_notifications_config()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/discovery":
+            b = json.dumps({
+                "service": "heating_hub",
+                "name": HUB_SITE_NAME,
+                "public_url": PUBLIC_HUB_URL,
+                "hub_api": "/api/hub",
+                "version": 1,
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
         self.send_response(404)
         self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        route = parsed.path
+
+        if route not in ("/api/notifications", "/api/notifications/test-email"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if route == "/api/notifications/test-email":
+            cfg = load_alert_config()
+            subject = "165 Water Street Heating Hub - Test Email"
+            body = (
+                "This is a test email from the 165 Water Street Heating Hub.\n\n"
+                f"Time: {now_utc_iso()}\n"
+                f"Live Hub: {PUBLIC_HUB_URL}\n"
+            )
+            sent = send_email_notification(cfg, subject, body)
+            b = json.dumps({
+                "ok": bool(sent),
+                "message": "Test email sent." if sent else "Email test failed. Check SMTP settings on the hub."
+            }).encode("utf-8")
+            self.send_response(200 if sent else 500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            b = json.dumps({"error": "invalid json"}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        cfg = load_alert_config()
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        try:
+            cooldown = int(body.get("cooldown_minutes", cfg.get("cooldown_minutes", DEFAULT_ALERT_COOLDOWN_MIN)))
+        except Exception:
+            cooldown = DEFAULT_ALERT_COOLDOWN_MIN
+        cfg["cooldown_minutes"] = max(1, cooldown)
+
+        email_cfg = cfg.get("email", {})
+        if not isinstance(email_cfg, dict):
+            email_cfg = {}
+        body_email = body.get("email", {})
+        if isinstance(body_email, dict):
+            if "enabled" in body_email:
+                email_cfg["enabled"] = bool(body_email.get("enabled"))
+            if "to" in body_email:
+                to_list = body_email.get("to", [])
+                if isinstance(to_list, str):
+                    to_list = [to_list]
+                if isinstance(to_list, list):
+                    email_cfg["to"] = [str(x).strip() for x in to_list if str(x).strip()]
+        cfg["email"] = email_cfg
+
+        if not save_alert_config(cfg):
+            b = json.dumps({"error": "failed to save alert config"}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        b = json.dumps({"ok": True, "message": "Notification settings saved", "config": public_notifications_config()}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
 
 if __name__ == "__main__":

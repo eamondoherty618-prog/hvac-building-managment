@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen, Request
 
 try:
     from gpiozero import Button
@@ -17,6 +18,7 @@ W1_BASE = Path('/sys/bus/w1/devices')
 DEFAULT_PORT = 8090
 SAMPLE_INTERVAL_SECONDS = 5
 NET_HELPER = '/usr/local/bin/zone-node-net.sh'
+KNOWN_PUBLIC_HUB_URL = 'https://165-boiler.tail58e171.ts.net/'
 
 stop_event = threading.Event()
 cache_lock = threading.Lock()
@@ -39,6 +41,95 @@ def run_net_helper(*args, timeout=20):
         }
     except Exception as e:
         return {'ok': False, 'code': -1, 'stdout': '', 'stderr': str(e)}
+
+
+def hub_discovery_candidates():
+    cfg = load_config()
+    cfg_url = ''
+    try:
+        cfg_url = ((cfg.get('hub') or {}).get('hub_url') or '').strip()
+    except Exception:
+        cfg_url = ''
+    candidates = [
+        cfg_url,
+        KNOWN_PUBLIC_HUB_URL,
+        'http://165-boiler.local:8080',
+        'http://165water-boiler.local:8080',
+        'http://165-boiler:8080',
+        'http://165water-boiler:8080',
+        'http://100.100.143.19:8080',
+        'http://192.168.4.181:8080',
+    ]
+    seen = set()
+    out = []
+    for c in candidates:
+        c = (c or '').strip().rstrip('/')
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def probe_hub(base_url, timeout=0.8):
+    base_url = (base_url or '').strip().rstrip('/')
+    if not base_url:
+        return None
+    # Prefer explicit discovery endpoint
+    for path in ('/api/discovery', '/api/hub'):
+        try:
+            req = Request(base_url + path, headers={'User-Agent': 'zone-node-discovery/1.0'})
+            with urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode('utf-8', errors='replace')
+            data = json.loads(raw or '{}')
+            if path == '/api/discovery':
+                if isinstance(data, dict) and data.get('service') == 'heating_hub':
+                    return {
+                        'ok': True,
+                        'hub_url': base_url,
+                        'name': data.get('name') or 'Heating Hub',
+                        'public_url': data.get('public_url') or '',
+                        'matched': path,
+                    }
+            else:
+                if isinstance(data, dict) and ('main' in data or 'downstream' in data):
+                    return {
+                        'ok': True,
+                        'hub_url': base_url,
+                        'name': 'Heating Hub',
+                        'public_url': '',
+                        'matched': path,
+                    }
+        except Exception:
+            continue
+    return None
+
+
+def discover_hubs():
+    tried = []
+    matches = []
+    seen_urls = set()
+    for c in hub_discovery_candidates():
+        tried.append(c)
+        hit = probe_hub(c)
+        if not hit:
+            continue
+        hub_url = (hit.get('hub_url') or '').rstrip('/')
+        if not hub_url or hub_url in seen_urls:
+            continue
+        seen_urls.add(hub_url)
+        matches.append(hit)
+        if len(matches) >= 4:
+            break
+    if matches:
+        return {
+            'ok': True,
+            'hub_url': matches[0].get('hub_url', ''),
+            'matches': matches,
+            'tried': tried,
+            'updated_utc': now_utc_iso(),
+        }
+    return {'ok': False, 'error': 'hub not found', 'matches': [], 'tried': tried, 'updated_utc': now_utc_iso()}
 
 
 def list_probes():
@@ -370,17 +461,6 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           <button type="button" class="secondary" id="swapProbesBtn">Swap Feed / Return</button>
         </div>
 
-        <div class="row">
-          <div>
-            <label>Heating Call GPIO</label>
-            <input type="number" name="call_gpio" min="2" max="27" value="17">
-          </div>
-          <div>
-            <label>Call Input Mode</label>
-            <input value="Dry contact to GND" disabled>
-          </div>
-        </div>
-
         <h2 style="margin-top:14px">Alerts</h2>
         <div class="row">
           <div>
@@ -420,7 +500,18 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         </div>
 
         <label>Hub URL (optional for now)</label>
-        <input name="hub_url" placeholder="https://165-boiler.tail58e171.ts.net">
+        <div class="row">
+          <div>
+            <input name="hub_url" placeholder="https://165-boiler.tail58e171.ts.net">
+          </div>
+          <div>
+            <button type="button" class="secondary" id="findHubBtn" style="width:100%">Find Hub</button>
+          </div>
+        </div>
+        <div id="hubChoicesWrap" class="hidden" style="margin-top:8px">
+          <small>Select detected hub:</small>
+          <div id="hubChoices" class="tabrow" style="margin-top:6px"></div>
+        </div>
 
         <div class="row">
           <div>
@@ -437,13 +528,14 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
         <button type="button" class="secondary" id="refreshBtn">Refresh Detected Probes</button>
       </form>
       <div id="msg"></div>
-      <div id="setupSuccess" class="success-box hidden">
-        <h3>Setup Successful</h3>
-        <div id="setupSuccessText">This zone node is connected and reporting.</div>
-        <div class="tabrow">
-          <button type="button" class="secondary" id="addAnotherBtn">Add Another Device</button>
-          <button type="button" id="showInstructionsBtn">Setup Instructions</button>
-        </div>
+        <div id="setupSuccess" class="success-box hidden">
+          <h3>Setup Successful</h3>
+          <div id="setupSuccessText">This zone node is connected and reporting.</div>
+          <div class="tabrow">
+            <button type="button" class="secondary" id="addAnotherBtn">Add Another Device</button>
+            <button type="button" id="showInstructionsBtn">Setup Instructions</button>
+            <a id="viewHubBtn" href="#" target="_blank" rel="noopener" class="itab hidden" style="text-decoration:none">View Hub</a>
+          </div>
         <div id="instructionsWrap" class="hidden">
           <div class="tabrow">
             <button type="button" class="itab active" data-itab="wiring">Wiring</button>
@@ -474,7 +566,12 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
           </div>
         </div>
       </div>
-      <small>Setup hotspot stays on during onboarding. Connect in iPhone Wi-Fi settings to <code>HeatingHub-Setup-xxxx</code>, then open <code>http://10.42.0.1:8090</code>. If Wi-Fi scan is unavailable in hotspot mode, use the manual SSID field.</small>
+      <div style="margin-top:10px">
+        <small>Setup hotspot stays on during onboarding. Connect in iPhone Wi-Fi settings to <code>HeatingHub-Setup-xxxx</code>, then open <code>http://10.42.0.1:8090</code>. If Wi-Fi scan is unavailable in hotspot mode, use the manual SSID field.</small>
+        <div style="margin-top:8px">
+          <small>Hub Link: <a id="hubUrlLink" href="#" target="_blank" rel="noopener">Not set</a></small>
+        </div>
+      </div>
     </div>
     <div class="card">
       <h2>Live Device Readings</h2>
@@ -493,15 +590,18 @@ function fillSelect(sel, probes, value){
   blank.value='';
   blank.textContent=(probes && probes.length) ? '-- Select Probe --' : '-- No Probes Detected --';
   sel.appendChild(blank);
-  for(const p of (probes||[])){
+  (probes||[]).forEach((p, idx) => {
     const sid = (typeof p === 'string') ? p : p.sensor_id;
     const temp = (p && p.temp_f !== undefined && p.temp_f !== null) ? `${Number(p.temp_f).toFixed(1)}°F` : '--';
     const err = (p && p.error) ? ` [${p.error}]` : '';
     const o=document.createElement('option');
     o.value=sid;
-    o.textContent = (typeof p === 'string') ? sid : `${sid} (${temp})${err}`;
+    const friendly = `Temp Probe ${idx + 1}`;
+    o.textContent = (typeof p === 'string')
+      ? `${friendly}`
+      : `${friendly} (${temp})${err}`;
     sel.appendChild(o);
-  }
+  });
   if(value!==undefined&&value!==null) sel.value=value;
 }
 function fillWifiSelect(sel, networks, current){
@@ -546,6 +646,85 @@ function fmtDateTime(iso, tz){
   }
 }
 function setMsg(t){ document.getElementById('msg').textContent = t || ''; }
+function hubRouteLabel(url){
+  const u = (url || '').trim().toLowerCase();
+  if (!u) return '';
+  if (u.startsWith('https://') && u.includes('.ts.net')) return 'Public (Tailscale Funnel)';
+  if (u.startsWith('http://100.')) return 'Tailscale (Private)';
+  if (u.startsWith('http://192.168.') || u.startsWith('http://10.') || u.startsWith('http://172.16.') || u.startsWith('http://172.17.') || u.startsWith('http://172.18.') || u.startsWith('http://172.19.') || u.startsWith('http://172.2') || u.startsWith('http://172.30.') || u.startsWith('http://172.31.')) return 'Local LAN';
+  if (u.includes('.local') || u.includes('165-boiler') || u.includes('165water-boiler')) return 'Local Hostname';
+  if (u.startsWith('https://')) return 'HTTPS';
+  if (u.startsWith('http://')) return 'HTTP';
+  return 'Hub';
+}
+function renderHubChoices(matches){
+  const wrap = document.getElementById('hubChoicesWrap');
+  const box = document.getElementById('hubChoices');
+  if(!wrap || !box) return;
+  box.innerHTML = '';
+  const arr = Array.isArray(matches) ? matches : [];
+  if(!arr.length){
+    wrap.classList.add('hidden');
+    return;
+  }
+  wrap.classList.remove('hidden');
+  arr.forEach((m, idx) => {
+    const url = (m && m.hub_url ? m.hub_url : '').trim();
+    if(!url) return;
+    const routeKind = hubRouteLabel(url);
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'secondary';
+    card.style.marginTop = '0';
+    card.style.textAlign = 'left';
+    card.style.display = 'flex';
+    card.style.flexDirection = 'column';
+    card.style.gap = '2px';
+    card.title = url;
+    const title = document.createElement('span');
+    title.textContent = `${m.name || 'Heating Hub'} ${arr.length > 1 ? `(${idx + 1})` : ''}`;
+    title.style.fontWeight = '700';
+    const sub = document.createElement('span');
+    sub.textContent = routeKind + (m.public_url && m.public_url.trim() === url ? '' : ` · ${url}`);
+    sub.style.fontSize = '.78rem';
+    sub.style.opacity = '.8';
+    card.appendChild(title);
+    card.appendChild(sub);
+    card.addEventListener('click', () => {
+      const f = document.getElementById('setupForm');
+      f.hub_url.value = url;
+      updateHubLinkUI(url);
+      setMsg(`Hub selected: ${url}`);
+    });
+    box.appendChild(card);
+  });
+  if(!box.children.length){
+    wrap.classList.add('hidden');
+  }
+}
+function updateHubLinkUI(url){
+  const link = document.getElementById('hubUrlLink');
+  const btn = document.getElementById('viewHubBtn');
+  const clean = (url || '').trim();
+  if(link){
+    if(clean){
+      link.href = clean;
+      link.textContent = clean;
+    } else {
+      link.href = '#';
+      link.textContent = 'Not set';
+    }
+  }
+  if(btn){
+    if(clean){
+      btn.href = clean;
+      btn.classList.remove('hidden');
+    } else {
+      btn.href = '#';
+      btn.classList.add('hidden');
+    }
+  }
+}
 function showSetupSuccess(show, text){
   const box = document.getElementById('setupSuccess');
   const txt = document.getElementById('setupSuccessText');
@@ -598,7 +777,6 @@ async function refreshAll(){
   f.zone_id.value = s.config.zone_id || '';
   f.parent_zone.value = s.config.parent_zone || 'Zone 1';
   f.timezone.value = s.config.timezone || 'America/New_York';
-  f.call_gpio.value = s.config.call_gpio || 17;
   f.low_temp_threshold_f.value = (s.config.alerts && s.config.alerts.low_temp_threshold_f != null) ? s.config.alerts.low_temp_threshold_f : 35;
   f.low_temp_enabled.value = (s.config.alerts && s.config.alerts.low_temp_enabled === false) ? 'false' : 'true';
   fillWifiSelect(document.getElementById('wifiSsidSel'), [], (s.config.wifi && s.config.wifi.ssid) || '');
@@ -606,6 +784,8 @@ async function refreshAll(){
   setWifiMode((s.config.wifi && s.config.wifi.ssid) ? 'manual' : 'select');
   f.wifi_key.value = '';
   f.hub_url.value = (s.config.hub && s.config.hub.hub_url) || '';
+  updateHubLinkUI(f.hub_url.value);
+  renderHubChoices([]);
   f.account_label.value = (s.config.hub && s.config.hub.account_label) || '';
   f.enroll_token.value = (s.config.hub && s.config.hub.enroll_token) || '';
   fillSelect(document.getElementById('feedSel'), s.probe_choices || s.probes_detected, s.config.feed_sensor_id || '');
@@ -671,6 +851,36 @@ async function refreshLive(){
     document.getElementById('liveSummary').innerHTML = `<div class="live-item"><div class="live-k">Error</div><div class="live-v">${e.message}</div></div>`;
   }
 }
+let hubAutoDiscoverTried = false;
+async function discoverHub(autoMode){
+  try {
+    if (!autoMode) setMsg('Looking for hub on local network / Tailscale...');
+    const res = await j('/api/hub/discover?_=' + Date.now());
+    const matches = Array.isArray(res && res.matches) ? res.matches : [];
+    if (matches.length > 1) {
+      renderHubChoices(matches);
+      if (!autoMode) setMsg(`Multiple hubs found (${matches.length}). Select the correct hub.`);
+      return true;
+    }
+    if (res && res.ok && res.hub_url) {
+      const f = document.getElementById('setupForm');
+      f.hub_url.value = res.hub_url;
+      updateHubLinkUI(res.hub_url);
+      renderHubChoices(matches);
+      if (!autoMode) {
+        setMsg(`Hub found: ${res.hub_url}`);
+      }
+      return true;
+    }
+    renderHubChoices([]);
+    if (!autoMode) setMsg('Hub not found automatically. Enter Hub URL manually.');
+    return false;
+  } catch (e) {
+    renderHubChoices([]);
+    if (!autoMode) setMsg('Hub lookup failed. Enter Hub URL manually.');
+    return false;
+  }
+}
 document.getElementById('setupForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const f = ev.target;
@@ -681,7 +891,7 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
     timezone: f.timezone.value.trim(),
     feed_sensor_id: f.feed_sensor_id.value,
     return_sensor_id: f.return_sensor_id.value,
-    call_gpio: Number(f.call_gpio.value || 17),
+    call_gpio: 17,
     alerts: { low_temp_threshold_f: Number(f.low_temp_threshold_f.value || 35), low_temp_enabled: (f.low_temp_enabled.value === 'true') },
     wifi: { ssid: (f.wifi_ssid_manual.value.trim() || f.wifi_ssid.value.trim()), password: f.wifi_key.value },
     hub: {
@@ -704,6 +914,8 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
 });
 document.getElementById('refreshBtn').addEventListener('click', async ()=>{ await refreshAll(); await refreshWifiStatus(); await refreshLive(); });
 document.getElementById('scanWifiBtn').addEventListener('click', async ()=>{ setMsg('Scanning Wi-Fi networks...'); await refreshWifiScan(); setMsg('Wi-Fi scan complete.'); });
+document.getElementById('setupForm').hub_url.addEventListener('input', (e)=> updateHubLinkUI(e.target.value));
+document.getElementById('findHubBtn').addEventListener('click', async ()=> { await discoverHub(false); });
 document.getElementById('wifiSsidSel').addEventListener('change', ()=>{
   const f = document.getElementById('setupForm');
   if (f.wifi_ssid.value) f.wifi_ssid_manual.value = f.wifi_ssid.value;
@@ -733,11 +945,152 @@ document.getElementById('showInstructionsBtn').addEventListener('click', ()=>{
 document.querySelectorAll('[data-itab]').forEach(btn => {
   btn.addEventListener('click', ()=> activateInstructionTab(btn.dataset.itab));
 });
-refreshAll(); refreshWifiStatus(); refreshLive(); refreshWifiScan();
+refreshAll().then(async ()=>{
+  const currentHub = (document.getElementById('setupForm').hub_url.value || '').trim();
+  if (!currentHub && !hubAutoDiscoverTried) {
+    hubAutoDiscoverTried = true;
+    await discoverHub(true);
+  }
+});
+refreshWifiStatus(); refreshLive(); refreshWifiScan();
 setInterval(refreshLive, 5000); setInterval(refreshWifiStatus, 10000);
 </script>
 </body>
 </html>'''
+
+
+def html_demo_page():
+    demo = html_page()
+    demo = demo.replace('<title>Zone Setup</title>', '<title>Zone Setup Demo</title>', 1)
+    demo = demo.replace('<h1>Zone Setup</h1>', '<h1>Zone Setup Demo</h1>', 1)
+    demo = demo.replace(
+        '<p>Phone-friendly setup for feed/return probe mapping, dry-contact call input, Wi-Fi assignment, and hub linking.</p>',
+        '<p>Read-only demo preview of the installer onboarding page. This view does not save changes or control any device.</p>',
+        1,
+    )
+    for a, b in (
+        ("'/api/setup-state", "'/demo/api/setup-state"),
+        ('"/api/setup-state', '"/demo/api/setup-state'),
+        ("'/api/zone", "'/demo/api/zone"),
+        ('"/api/zone', '"/demo/api/zone'),
+        ("'/api/wifi/status", "'/demo/api/wifi/status"),
+        ('"/api/wifi/status', '"/demo/api/wifi/status'),
+        ("'/api/wifi/scan", "'/demo/api/wifi/scan"),
+        ('"/api/wifi/scan', '"/demo/api/wifi/scan'),
+        ("'/api/setup'", "'/demo/api/setup'"),
+        ('"/api/setup"', '"/demo/api/setup"'),
+        ("'/api/hub/discover", "'/demo/api/hub/discover"),
+        ('"/api/hub/discover', '"/demo/api/hub/discover'),
+    ):
+        demo = demo.replace(a, b)
+    demo_inject = r"""
+<script>
+(() => {
+  window.addEventListener('load', () => {
+    const msg = document.getElementById('msg');
+    if (msg) msg.textContent = 'Demo Mode: safe preview only. Changes are not saved.';
+    const badge = document.getElementById('cfgState');
+    if (badge) badge.textContent = 'Demo Preview';
+    const saveBtn = document.querySelector('#setupForm button[type="submit"]');
+    if (saveBtn) saveBtn.textContent = 'Preview Save (Demo Only)';
+  });
+})();
+</script>
+"""
+    if "<script>\nasync function j(" in demo:
+        return demo.replace("<script>\nasync function j(", demo_inject + "\n<script>\nasync function j(", 1)
+    return demo.replace("</body>", demo_inject + "\n</body>", 1)
+
+
+def demo_setup_state():
+    return {
+        'configured': False,
+        'config': {
+            'configured': False,
+            'unit_name': '',
+            'zone_id': '',
+            'parent_zone': 'Zone 1',
+            'timezone': 'America/New_York',
+            'feed_sensor_id': '',
+            'return_sensor_id': '',
+            'call_gpio': 17,
+            'alerts': {'low_temp_enabled': True, 'low_temp_threshold_f': 35},
+            'wifi': {'ssid': '', 'password': ''},
+            'hub': {'hub_url': 'https://165-boiler.tail58e171.ts.net/', 'account_label': '165 Water Street', 'enroll_token': ''},
+        },
+        'probes_detected': ['28-0417701d59ff', '28-041770d515ff'],
+        'probe_choices': [
+            {'sensor_id': '28-0417701d59ff', 'temp_f': 118.6, 'error': None},
+            {'sensor_id': '28-041770d515ff', 'temp_f': 110.2, 'error': None},
+        ],
+        'updated_utc': now_utc_iso(),
+    }
+
+
+def demo_zone_payload():
+    return {
+        'configured': False,
+        'unit_name': 'Example Zone Node',
+        'zone_id': 'zone1-av-room',
+        'parent_zone': 'Zone 1',
+        'timezone': 'America/New_York',
+        'feed_f': 118.6,
+        'return_f': 110.2,
+        'feed_sensor_id': '28-0417701d59ff',
+        'return_sensor_id': '28-041770d515ff',
+        'feed_error': None,
+        'return_error': None,
+        'heating_call': True,
+        'call_status': '24VAC Present (Calling)',
+        'low_temp_enabled': True,
+        'low_temp_threshold_f': 35.0,
+        'low_temp_alert': False,
+        'low_temp_status': 'Normal',
+        'low_temp_detail': '',
+        'wifi_ssid': 'Example-Building-WiFi',
+        'updated_utc': now_utc_iso(),
+    }
+
+
+def demo_wifi_status():
+    return {
+        'ok': True,
+        'connected_ssid': 'Example-Building-WiFi',
+        'ap_active': False,
+        'ap_ssid': '',
+        'updated_utc': now_utc_iso(),
+    }
+
+
+def demo_wifi_scan():
+    return {
+        'ok': True,
+        'updated_utc': now_utc_iso(),
+        'networks': [
+            {'ssid': 'Example-Building-WiFi', 'signal': 78, 'security': 'WPA2'},
+            {'ssid': 'Guest-WiFi', 'signal': 51, 'security': 'WPA2'},
+            {'ssid': 'MechanicalRoom', 'signal': 32, 'security': 'WPA2'},
+        ],
+    }
+
+
+def demo_hub_discover():
+    return {
+        'ok': True,
+        'hub_url': KNOWN_PUBLIC_HUB_URL.rstrip('/'),
+        'matches': [{
+            'ok': True,
+            'hub_url': KNOWN_PUBLIC_HUB_URL.rstrip('/'),
+            'name': '165 Water Street Heating Hub',
+            'public_url': KNOWN_PUBLIC_HUB_URL,
+            'matched': '/api/discovery',
+        }],
+        'name': '165 Water Street Heating Hub',
+        'public_url': KNOWN_PUBLIC_HUB_URL,
+        'matched': '/api/discovery',
+        'tried': [KNOWN_PUBLIC_HUB_URL.rstrip('/')],
+        'updated_utc': now_utc_iso(),
+    }
 
 
 class H(BaseHTTPRequestHandler):
@@ -763,6 +1116,18 @@ class H(BaseHTTPRequestHandler):
         route = urlparse(self.path).path
         if route in ('/', '/setup'):
             return self._send_html(html_page())
+        if route == '/demo':
+            return self._send_html(html_demo_page())
+        if route == '/demo/api/setup-state':
+            return self._send_json(demo_setup_state())
+        if route == '/demo/api/zone':
+            return self._send_json(demo_zone_payload())
+        if route == '/demo/api/wifi/status':
+            return self._send_json(demo_wifi_status())
+        if route == '/demo/api/wifi/scan':
+            return self._send_json(demo_wifi_scan())
+        if route == '/demo/api/hub/discover':
+            return self._send_json(demo_hub_discover())
         if route == '/api/setup-state':
             cfg = load_config()
             safe_cfg = json.loads(json.dumps(cfg))
@@ -791,6 +1156,8 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return self._send_json(payload)
+        if route == '/api/hub/discover':
+            return self._send_json(discover_hubs())
         return self._send_json({'error': 'not found'}, 404)
 
     def do_POST(self):
@@ -802,6 +1169,14 @@ class H(BaseHTTPRequestHandler):
             if res.get('ok'):
                 return self._send_json({'ok': True, 'message': msg, 'result': res})
             return self._send_json({'error': res.get('stderr') or res.get('stdout') or 'wifi helper failed', 'result': res}, 500)
+
+        if route == '/demo/api/setup':
+            return self._send_json({
+                'ok': True,
+                'configured': True,
+                'message': 'Demo mode: configuration preview only (nothing was saved)',
+                'wifi_apply': {'ok': True, 'stdout': 'demo', 'stderr': ''},
+            })
 
         if route != '/api/setup':
             return self._send_json({'error': 'not found'}, 404)
@@ -822,10 +1197,8 @@ class H(BaseHTTPRequestHandler):
         cfg['timezone'] = str(body.get('timezone') or cfg.get('timezone') or 'America/New_York').strip() or 'America/New_York'
         cfg['feed_sensor_id'] = str(body.get('feed_sensor_id') or '').strip()
         cfg['return_sensor_id'] = str(body.get('return_sensor_id') or '').strip()
-        try:
-            cfg['call_gpio'] = int(body.get('call_gpio', cfg.get('call_gpio', 17)) or 17)
-        except Exception:
-            cfg['call_gpio'] = 17
+        cfg['call_gpio'] = 17
+        cfg['call_active_mode'] = 'dry_contact_to_gnd'
 
         hub = cfg.get('hub', {}) if isinstance(cfg.get('hub'), dict) else {}
         body_hub = body.get('hub', {}) if isinstance(body.get('hub'), dict) else {}
