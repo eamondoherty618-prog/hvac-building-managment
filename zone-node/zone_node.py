@@ -1229,6 +1229,29 @@ def demo_hub_discover():
 
 
 class H(BaseHTTPRequestHandler):
+    def _redirect(self, location: str, code=302):
+        self.send_response(code)
+        self.send_header('Location', location)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def _is_captive_probe(self, route: str) -> bool:
+        probes = {
+            '/generate_204',               # Android
+            '/gen_204',
+            '/hotspot-detect.html',        # Apple
+            '/library/test/success.html',  # Apple variant
+            '/success.txt',
+            '/connecttest.txt',            # Windows
+            '/ncsi.txt',                   # Windows legacy
+            '/redirect',                   # CNA probes / misc
+            '/canonical.html',
+            '/fwlink',
+            '/kindle-wifi/wifistub.html',
+        }
+        return route in probes
+
     def _send_json(self, obj, code=200):
         b = json.dumps(obj).encode('utf-8')
         self.send_response(code)
@@ -1249,6 +1272,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         route = urlparse(self.path).path
+        if self._is_captive_probe(route):
+            # Return a redirect (not a success response) so mobile OS captive checks
+            # recognize the hotspot as a captive portal and open the setup page.
+            return self._redirect('http://10.42.0.1:8090/setup', 302)
         if route in ('/', '/setup'):
             return self._send_html(html_page())
         if route == '/demo':
@@ -1305,6 +1332,16 @@ class H(BaseHTTPRequestHandler):
                 'updated_utc': now_utc_iso(),
             })
         return self._send_json({'error': 'not found'}, 404)
+
+    def do_HEAD(self):
+        route = urlparse(self.path).path
+        if self._is_captive_probe(route):
+            return self._redirect('http://10.42.0.1:8090/setup', 302)
+        # Minimal response for non-captive HEAD requests
+        self.send_response(200 if route in ('/', '/setup') else 404)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def do_POST(self):
         route = urlparse(self.path).path
