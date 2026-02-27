@@ -5,6 +5,7 @@ import smtplib
 import uuid
 import subprocess
 import re
+import shutil
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,9 +39,18 @@ DEVICE_OFFLINE_ALERT_THRESHOLD_SECONDS = 300
 ALERT_CONFIG_PATH = Path("/home/eamondoherty618/alert_config.json")
 ALERT_LOG_PATH = Path("/home/eamondoherty618/alert_events.log")
 USERS_CONFIG_PATH = Path("/home/eamondoherty618/hub_users.json")
+BUILDINGS_CONFIG_PATH = Path("/home/eamondoherty618/hub_buildings.json")
 ALERT_EVENTS_JSONL_PATH = Path("/home/eamondoherty618/hub_alert_events.jsonl")
 SITE_MAP_CONFIG_PATH = Path("/home/eamondoherty618/hub_site_map.json")
 COMMISSIONING_CONFIG_PATH = Path("/home/eamondoherty618/hub_commissioning.json")
+BUILDING_DATA_ROOT = Path("/home/eamondoherty618/hub_building_data")
+LEGACY_CONFIG_PATH = CONFIG_PATH
+LEGACY_HISTORY_FILE = HISTORY_FILE
+LEGACY_CALL_CYCLES_FILE = CALL_CYCLES_FILE
+LEGACY_ALERT_LOG_PATH = ALERT_LOG_PATH
+LEGACY_ALERT_EVENTS_JSONL_PATH = ALERT_EVENTS_JSONL_PATH
+LEGACY_SITE_MAP_CONFIG_PATH = SITE_MAP_CONFIG_PATH
+LEGACY_COMMISSIONING_CONFIG_PATH = COMMISSIONING_CONFIG_PATH
 DEFAULT_ALERT_COOLDOWN_MIN = 120
 ZONE1_CALL_ALERT_GRACE_SECONDS = 120
 PUBLIC_HUB_URL = "https://165-boiler.tail58e171.ts.net/"
@@ -58,29 +68,7 @@ DEFAULT_ALERT_PREFS = {
 }
 
 DEFAULT_CONFIG = {
-    "zones": [
-        {
-            "id": "zone1-av-room",
-            "name": "AV Room Coil",
-            "parent_zone": "Zone 1",
-            "source_url": "http://100.100.100.100:8090/api/zone",
-            "delta_ok_f": 8.0,
-        },
-        {
-            "id": "zone1-first-floor-prod",
-            "name": "1st Floor Production",
-            "parent_zone": "Zone 1",
-            "source_url": "http://100.100.100.101:8090/api/zone",
-            "delta_ok_f": 8.0,
-        },
-        {
-            "id": "zone2-example",
-            "name": "Zone 2 Example",
-            "parent_zone": "Zone 2",
-            "source_url": "http://100.100.100.102:8090/api/zone",
-            "delta_ok_f": 8.0,
-        },
-    ]
+    "zones": []
 }
 
 stop_event = threading.Event()
@@ -218,6 +206,217 @@ def public_users_config():
     return {"users": cfg.get("users", []), "updated_utc": now_utc_iso()}
 
 
+def default_buildings_config():
+    return {
+        "active_building_id": "local",
+        "buildings": [
+            {
+                "id": "local",
+                "name": "165 Water Street",
+                "address": "",
+                "hub_url": str(PUBLIC_HUB_URL or "").rstrip("/"),
+                "notes": "Primary hub",
+            }
+        ],
+        "updated_utc": now_utc_iso(),
+    }
+
+
+def normalize_hub_url(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = "https://" + raw
+    return raw.rstrip("/")
+
+
+def load_buildings_config():
+    if not BUILDINGS_CONFIG_PATH.exists():
+        cfg = default_buildings_config()
+        for b in cfg.get("buildings", []):
+            if isinstance(b, dict):
+                try:
+                    init_building_state(str(b.get("id") or ""), reset=False)
+                except Exception:
+                    pass
+        save_buildings_config(cfg)
+        return cfg
+    try:
+        data = json.loads(BUILDINGS_CONFIG_PATH.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("buildings config not dict")
+        raw_buildings = data.get("buildings", [])
+        if not isinstance(raw_buildings, list):
+            raw_buildings = []
+        out = []
+        used = set()
+        for b in raw_buildings:
+            if not isinstance(b, dict):
+                continue
+            bid = str(b.get("id") or "").strip().lower()
+            if not bid:
+                bid = f"building-{uuid.uuid4().hex[:8]}"
+            if bid in used:
+                continue
+            used.add(bid)
+            out.append({
+                "id": bid,
+                "name": str(b.get("name") or "").strip() or bid,
+                "address": str(b.get("address") or "").strip(),
+                "hub_url": normalize_hub_url(b.get("hub_url") or ""),
+                "notes": str(b.get("notes") or "").strip(),
+            })
+        if not any(b.get("id") == "local" for b in out):
+            out.insert(0, {
+                "id": "local",
+                "name": "165 Water Street",
+                "address": "",
+                "hub_url": str(PUBLIC_HUB_URL or "").rstrip("/"),
+                "notes": "Primary hub",
+            })
+        active = str(data.get("active_building_id") or "local").strip().lower() or "local"
+        if not any(b.get("id") == active for b in out):
+            active = "local"
+        cfg = {"active_building_id": active, "buildings": out, "updated_utc": now_utc_iso()}
+        for b in out:
+            if isinstance(b, dict):
+                try:
+                    init_building_state(str(b.get("id") or ""), reset=False)
+                except Exception:
+                    pass
+        save_buildings_config(cfg)
+        return cfg
+    except Exception:
+        cfg = default_buildings_config()
+        for b in cfg.get("buildings", []):
+            if isinstance(b, dict):
+                try:
+                    init_building_state(str(b.get("id") or ""), reset=False)
+                except Exception:
+                    pass
+        save_buildings_config(cfg)
+        return cfg
+
+
+def save_buildings_config(cfg):
+    try:
+        BUILDINGS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cfg = dict(cfg or {})
+        cfg["updated_utc"] = now_utc_iso()
+        BUILDINGS_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def public_buildings_config():
+    cfg = load_buildings_config()
+    return {
+        "active_building_id": cfg.get("active_building_id", "local"),
+        "buildings": cfg.get("buildings", []),
+        "updated_utc": now_utc_iso(),
+    }
+
+
+def normalize_building_id(raw):
+    bid = re.sub(r"[^a-z0-9]+", "-", str(raw or "").strip().lower()).strip("-")
+    return bid or "local"
+
+
+def active_building_id():
+    cfg = load_buildings_config()
+    rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+    active = normalize_building_id(cfg.get("active_building_id") or "local")
+    if any(isinstance(r, dict) and normalize_building_id(r.get("id")) == active for r in rows):
+        return active
+    return "local"
+
+
+def building_data_dir(building_id=None):
+    bid = normalize_building_id(building_id or active_building_id())
+    return BUILDING_DATA_ROOT / bid
+
+
+def building_scoped_path(filename, legacy_path=None, building_id=None):
+    bid = normalize_building_id(building_id or active_building_id())
+    target = building_data_dir(bid) / str(filename)
+    if target.exists():
+        return target
+    # Migrate legacy single-building files only into the local/default building.
+    if bid == "local" and legacy_path and Path(legacy_path).exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(legacy_path), str(target))
+            return target
+        except Exception:
+            pass
+        return Path(legacy_path)
+    return target
+
+
+def downstream_config_path():
+    return building_scoped_path("downstream_zones.json", LEGACY_CONFIG_PATH)
+
+
+def history_file_path():
+    return building_scoped_path("hub_history.jsonl", LEGACY_HISTORY_FILE)
+
+
+def call_cycles_file_path():
+    return building_scoped_path("hub_call_cycles.jsonl", LEGACY_CALL_CYCLES_FILE)
+
+
+def alert_log_path():
+    return building_scoped_path("alert_events.log", LEGACY_ALERT_LOG_PATH)
+
+
+def alert_events_jsonl_path():
+    return building_scoped_path("hub_alert_events.jsonl", LEGACY_ALERT_EVENTS_JSONL_PATH)
+
+
+def site_map_config_path():
+    return building_scoped_path("hub_site_map.json", LEGACY_SITE_MAP_CONFIG_PATH)
+
+
+def commissioning_config_path():
+    return building_scoped_path("hub_commissioning.json", LEGACY_COMMISSIONING_CONFIG_PATH)
+
+
+def init_building_state(building_id, reset=False):
+    bid = normalize_building_id(building_id)
+    if not bid:
+        return
+    bdir = building_data_dir(bid)
+    try:
+        bdir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    zones_path = bdir / "downstream_zones.json"
+    site_map_path = bdir / "hub_site_map.json"
+    commissioning_path = bdir / "hub_commissioning.json"
+    history_path = bdir / "hub_history.jsonl"
+    cycles_path = bdir / "hub_call_cycles.jsonl"
+    alerts_path = bdir / "hub_alert_events.jsonl"
+    log_path = bdir / "alert_events.log"
+
+    if reset or not zones_path.exists():
+        zones_path.write_text(json.dumps({"zones": []}, indent=2) + "\n")
+    if reset or not site_map_path.exists():
+        site_map_path.write_text(json.dumps(default_site_map_config(), indent=2) + "\n")
+    if reset or not commissioning_path.exists():
+        commissioning_path.write_text(json.dumps(default_commissioning_config(), indent=2) + "\n")
+    if reset or not history_path.exists():
+        history_path.write_text("")
+    if reset or not cycles_path.exists():
+        cycles_path.write_text("")
+    if reset or not alerts_path.exists():
+        alerts_path.write_text("")
+    if reset or not log_path.exists():
+        log_path.write_text("")
+
+
 def default_site_map_config():
     return {
         "address": "",
@@ -238,12 +437,13 @@ def default_commissioning_config():
 
 
 def load_commissioning_config():
-    if not COMMISSIONING_CONFIG_PATH.exists():
+    path = commissioning_config_path()
+    if not path.exists():
         cfg = default_commissioning_config()
         save_commissioning_config(cfg)
         return cfg
     try:
-        data = json.loads(COMMISSIONING_CONFIG_PATH.read_text())
+        data = json.loads(path.read_text())
         if not isinstance(data, dict):
             raise ValueError("not dict")
         out = default_commissioning_config()
@@ -279,8 +479,9 @@ def load_commissioning_config():
 
 def save_commissioning_config(cfg):
     try:
-        COMMISSIONING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        COMMISSIONING_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+        path = commissioning_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cfg, indent=2) + "\n")
         return True
     except Exception:
         return False
@@ -301,6 +502,7 @@ def backup_export_bundle():
         "hub_site_name": HUB_SITE_NAME,
         "public_hub_url": PUBLIC_HUB_URL,
         "downstream_zones": {"zones": load_config()},
+        "buildings": load_buildings_config(),
         "users": load_users_config(),
         "site_map": load_site_map_config(),
         "commissioning": load_commissioning_config(),
@@ -318,6 +520,16 @@ def restore_from_backup_bundle(bundle):
         if isinstance(zones, list):
             if not save_config_zones(zones):
                 return False, "failed to restore downstream zones"
+    if isinstance(bundle.get("buildings"), dict):
+        if not save_buildings_config(bundle["buildings"]):
+            return False, "failed to restore buildings"
+        try:
+            bcfg = load_buildings_config()
+            for b in bcfg.get("buildings", []):
+                if isinstance(b, dict):
+                    init_building_state(str(b.get("id") or ""), reset=False)
+        except Exception:
+            pass
     if isinstance(bundle.get("users"), dict):
         if not save_users_config(bundle["users"]):
             return False, "failed to restore users"
@@ -344,12 +556,13 @@ def restore_from_backup_bundle(bundle):
 
 
 def load_site_map_config():
-    if not SITE_MAP_CONFIG_PATH.exists():
+    path = site_map_config_path()
+    if not path.exists():
         cfg = default_site_map_config()
         save_site_map_config(cfg)
         return cfg
     try:
-        data = json.loads(SITE_MAP_CONFIG_PATH.read_text())
+        data = json.loads(path.read_text())
         if not isinstance(data, dict):
             raise ValueError("not a dict")
         cfg = default_site_map_config()
@@ -437,7 +650,8 @@ def load_site_map_config():
 
 def save_site_map_config(cfg):
     try:
-        SITE_MAP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        path = site_map_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         cfg_out = default_site_map_config()
         if isinstance(cfg, dict):
             cfg_out["address"] = str(cfg.get("address") or "")
@@ -524,7 +738,7 @@ def save_site_map_config(cfg):
                                 continue
                         cfg_out["pins"][str(zid)]["polygon"] = norm_poly
         cfg_out["updated_utc"] = now_utc_iso()
-        SITE_MAP_CONFIG_PATH.write_text(json.dumps(cfg_out, indent=2) + "\n")
+        path.write_text(json.dumps(cfg_out, indent=2) + "\n")
         return True
     except Exception:
         return False
@@ -566,8 +780,9 @@ def recipients_for_alert_code(alert_code, alert_cfg):
 
 def append_structured_alert_event(event):
     try:
-        ALERT_EVENTS_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with ALERT_EVENTS_JSONL_PATH.open("a", encoding="utf-8") as f:
+        path = alert_events_jsonl_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
     except Exception:
         pass
@@ -595,10 +810,11 @@ def record_alert_dispatch_event(category, zone_id, zone_label, subject, detail, 
 
 def recent_alert_events(limit=100):
     out = []
-    if not ALERT_EVENTS_JSONL_PATH.exists():
+    path = alert_events_jsonl_path()
+    if not path.exists():
         return out
     try:
-        with ALERT_EVENTS_JSONL_PATH.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -622,12 +838,13 @@ def unacknowledged_alert_count(limit=1000):
 
 
 def acknowledge_alert_event(event_id, who="", note=""):
-    if not ALERT_EVENTS_JSONL_PATH.exists():
+    path = alert_events_jsonl_path()
+    if not path.exists():
         return False, "alert log not found"
     changed = False
     rows = []
     try:
-        with ALERT_EVENTS_JSONL_PATH.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -644,7 +861,7 @@ def acknowledge_alert_event(event_id, who="", note=""):
                     changed = True
                 rows.append(obj)
         if changed:
-            with ALERT_EVENTS_JSONL_PATH.open("w", encoding="utf-8") as f:
+            with path.open("w", encoding="utf-8") as f:
                 for obj in rows:
                     f.write(json.dumps(obj) + "\n")
             return True, "acknowledged"
@@ -655,8 +872,9 @@ def acknowledge_alert_event(event_id, who="", note=""):
 
 def log_alert_event(msg):
     try:
-        ALERT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with ALERT_LOG_PATH.open("a", encoding="utf-8") as f:
+        path = alert_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(f"{now_utc_iso()} {msg}\n")
     except Exception:
         pass
@@ -1177,14 +1395,16 @@ def trigger_zone1_alert_from_local(local):
 
 
 def ensure_config():
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    path = downstream_config_path()
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
 
 
 def load_config():
     ensure_config()
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        data = json.loads(downstream_config_path().read_text())
         zones = data.get("zones", [])
         if isinstance(zones, list):
             return zones
@@ -1195,8 +1415,9 @@ def load_config():
 
 def save_config_zones(zones):
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps({"zones": zones}, indent=2) + "\n")
+        path = downstream_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"zones": zones}, indent=2) + "\n")
         return True
     except Exception:
         return False
@@ -1472,6 +1693,18 @@ def get_downstream_cached():
         return list(downstream_cache)
 
 
+def reset_runtime_state_for_building_switch():
+    global downstream_cache, downstream_cache_updated_utc
+    global downstream_offline_state, downstream_hardware_state
+    with downstream_cache_lock:
+        downstream_cache = []
+        downstream_cache_updated_utc = now_utc_iso()
+    with cycle_state_lock:
+        cycle_trackers.clear()
+    downstream_offline_state = {}
+    downstream_hardware_state = {}
+
+
 def make_sample(local=None, downstream=None):
     if local is None:
         local = get_local_cached() or local_payload_placeholder()
@@ -1499,14 +1732,16 @@ def make_sample(local=None, downstream=None):
 
 
 def append_sample(sample):
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+    path = history_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(sample) + "\n")
 
 
 def append_call_cycle_event(event):
-    CALL_CYCLES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with CALL_CYCLES_FILE.open("a", encoding="utf-8") as f:
+    path = call_cycles_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
 
 
@@ -1614,11 +1849,12 @@ def update_all_cycle_tracking(local, downstream):
 
 
 def prune_history():
-    if not HISTORY_FILE.exists():
+    path = history_file_path()
+    if not path.exists():
         return
     cutoff = now_utc() - timedelta(days=RETENTION_DAYS)
     keep = []
-    with HISTORY_FILE.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1630,17 +1866,18 @@ def prune_history():
                 continue
             if ts >= cutoff:
                 keep.append(obj)
-    with HISTORY_FILE.open("w", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8") as f:
         for obj in keep:
             f.write(json.dumps(obj) + "\n")
 
 
 def prune_call_cycles():
-    if not CALL_CYCLES_FILE.exists():
+    path = call_cycles_file_path()
+    if not path.exists():
         return
     cutoff = now_utc() - timedelta(days=RETENTION_DAYS)
     keep = []
-    with CALL_CYCLES_FILE.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1652,7 +1889,7 @@ def prune_call_cycles():
                 continue
             if end_ts and end_ts >= cutoff:
                 keep.append(obj)
-    with CALL_CYCLES_FILE.open("w", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8") as f:
         for obj in keep:
             f.write(json.dumps(obj) + "\n")
 
@@ -1691,8 +1928,9 @@ def cycle_analytics_for_window(window_key, zone_id="zone1_main"):
     short_cycle_count = 0
     response_samples = []
     no_response_count = 0
-    if CALL_CYCLES_FILE.exists():
-        with CALL_CYCLES_FILE.open("r", encoding="utf-8") as f:
+    cycles_path = call_cycles_file_path()
+    if cycles_path.exists():
+        with cycles_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -1786,9 +2024,10 @@ def history_for_window(window_key):
     window = windows.get(window_key, windows["24h"])
     cutoff = now_utc() - window
     out = []
-    if not HISTORY_FILE.exists():
+    history_path = history_file_path()
+    if not history_path.exists():
         return out
-    with HISTORY_FILE.open("r", encoding="utf-8") as f:
+    with history_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1891,6 +2130,36 @@ HTML = """<!doctype html>
     .head-pill-btn.attn{border-color:rgba(255,120,120,.95); background:rgba(165,29,45,.28)}
     .head-pill-btn .badge-dot{display:none;margin-left:6px;min-width:18px;height:18px;border-radius:999px;background:#ff6b6b;color:#fff;font-size:.72rem;line-height:18px;text-align:center;font-weight:800;vertical-align:middle;padding:0 4px}
     .head-pill-btn.attn .badge-dot{display:inline-block}
+    .building-switch-wrap{max-width:440px}
+    .building-switch-label{margin-bottom:4px;color:#d5e7f0;font-size:.78rem;letter-spacing:.04em;text-transform:uppercase}
+    .building-switch{
+      width:100%;
+      min-height:42px;
+      border:1px solid rgba(255,255,255,.34);
+      border-radius:12px;
+      padding:8px 40px 8px 12px;
+      color:#f2fbff;
+      font-weight:700;
+      background-color:rgba(255,255,255,.12);
+      box-shadow:0 2px 10px rgba(7,33,47,.2);
+      appearance:none;
+      -webkit-appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='rgba(242,251,255,0.95)' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+      background-repeat:no-repeat;
+      background-position:right 12px center;
+      background-size:16px 16px;
+    }
+    .building-switch:hover{background-color:rgba(255,255,255,.18)}
+    .building-switch:focus{
+      outline:none;
+      border-color:rgba(171,224,245,.95);
+      box-shadow:0 0 0 3px rgba(96,180,211,.25), 0 2px 10px rgba(7,33,47,.2);
+    }
+    .building-switch option{
+      color:#0f2029;
+      background:#ffffff;
+      font-weight:600;
+    }
     .head-action-wrap{position:relative}
     .head-menu{position:absolute;right:0;top:calc(100% + 8px);min-width:240px;background:#fff;color:#16303b;border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 28px rgba(10,31,44,.18);padding:8px;z-index:1500;display:none}
     .head-menu.show{display:block}
@@ -2108,7 +2377,11 @@ HTML = """<!doctype html>
 <body class=\"text-body\">
   <div class=\"wrap\">
     <header class=\"head\" id=\"mainTop\">
-      <div>
+      <div style=\"display:flex;flex-direction:column;gap:8px;min-width:280px\">
+        <div class=\"building-switch-wrap\">
+          <label class=\"building-switch-label\" for=\"buildingSwitcher\">Building Dashboard</label>
+          <select id=\"buildingSwitcher\" class=\"building-switch\"></select>
+        </div>
         <h1 id=\"hubTitle\">Heating Hub</h1>
         <div class=\"meta\">Main Boiler Zone(s) + Heating Zones</div>
       </div>
@@ -2329,6 +2602,39 @@ HTML = """<!doctype html>
       </form>
       <div id=\"notifMsg\" class=\"msg\"></div>
     </section>
+
+      <div id=\"adminBuildingsPanel\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"smallnote\" style=\"margin-bottom:8px\">Create multiple building profiles and switch between hub links from the dashboard header.</div>
+        <div class=\"form-grid\">
+          <div>
+            <label class=\"label\" for=\"buildingName\">Building Name</label>
+            <input id=\"buildingName\" class=\"input\" placeholder=\"165 Water Street\">
+          </div>
+          <div>
+            <label class=\"label\" for=\"buildingAddress\">Address</label>
+            <input id=\"buildingAddress\" class=\"input\" placeholder=\"165 Water Street, New Haven, CT 06511\">
+          </div>
+          <div>
+            <label class=\"label\" for=\"buildingHubUrl\">Hub URL</label>
+            <input id=\"buildingHubUrl\" class=\"input\" placeholder=\"https://building-hub.example.com\">
+          </div>
+          <div>
+            <label class=\"label\" for=\"buildingNotes\">Notes</label>
+            <input id=\"buildingNotes\" class=\"input\" placeholder=\"Main mechanical room / property manager notes\">
+          </div>
+          <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+            <button type=\"button\" class=\"btn active\" id=\"saveBuildingBtn\">Save Building</button>
+            <button type=\"button\" class=\"btn\" id=\"clearBuildingFormBtn\">Clear Form</button>
+          </div>
+        </div>
+        <div id=\"buildingsMsg\" class=\"msg\"></div>
+        <div class=\"table-responsive\" style=\"margin-top:10px\">
+          <table class=\"table table-hover align-middle mb-0\">
+            <thead><tr><th>Name</th><th>Address</th><th>Hub URL</th><th>Notes</th><th>Actions</th></tr></thead>
+            <tbody id=\"buildingsBody\"></tbody>
+          </table>
+        </div>
+      </div>
 
       <div id=\"adminUsersPanel\" style=\"margin-top:12px\">
         <div class=\"smallnote\" style=\"margin-bottom:8px\">Manage users, roles, and alert subscriptions.</div>
@@ -3060,6 +3366,7 @@ HTML = """<!doctype html>
   </div>
 
   <script>
+    const BUILDING_SWITCH_ADD_VALUE = "__add__";
     let activeRange = "live";
     let activeCycleRange = "24h";
     let activeCycleZoneId = "zone1_main";
@@ -3071,6 +3378,7 @@ HTML = """<!doctype html>
     let pendingGraphTabId = "";
     let pendingCycleZoneId = "";
     let usersCache = [];
+    let buildingsCache = { active_building_id: "local", buildings: [] };
     let alertEventsCache = [];
     let activeAlertLogFilter = "trouble";
     let zoneMgmtStatusCache = null;
@@ -3111,6 +3419,7 @@ HTML = """<!doctype html>
     let mainMapPreviewLastRenderKey = "";
     let siteMapAutoOpenZoneSetupAfterBuildingSave = false;
     let siteMapPendingOutlineConfirmSourceLabel = "";
+    const addressSuggestState = {};
     const livePoints = [];
     const LIVE_MAX_POINTS = 240;
 
@@ -3491,8 +3800,9 @@ HTML = """<!doctype html>
       const street = String(document.getElementById("siteAddrStreet")?.value || "").trim();
       const zip = String(document.getElementById("siteAddrZip")?.value || "").trim();
       const state = String(document.getElementById("siteAddrState")?.value || "").trim().toUpperCase();
+      const looksLikeFullAddress = street.includes(",");
       const tail = [state, zip].filter(Boolean).join(" ");
-      const q = [street, tail].filter(Boolean).join(", ");
+      const q = looksLikeFullAddress ? street : [street, tail].filter(Boolean).join(", ");
       const hidden = document.getElementById("siteAddress");
       if (hidden) hidden.value = q;
       const stateEl = document.getElementById("siteAddrState");
@@ -3500,11 +3810,102 @@ HTML = """<!doctype html>
       return q;
     }
 
+    function ensureAddressDatalist(inputId) {
+      const input = document.getElementById(inputId);
+      if (!input) return null;
+      const listId = `${inputId}_suggestions`;
+      let dl = document.getElementById(listId);
+      if (!dl) {
+        dl = document.createElement("datalist");
+        dl.id = listId;
+        document.body.appendChild(dl);
+      }
+      input.setAttribute("list", listId);
+      return dl;
+    }
+
+    function parseStateZipFromAddressText(addr) {
+      const txt = String(addr || "").trim();
+      const m = txt.match(/(?:,|\s)([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)\b/);
+      if (!m) return { state: "", zip: "" };
+      return { state: String(m[1] || "").toUpperCase(), zip: String(m[2] || "") };
+    }
+
+    function initAddressAutocomplete(inputId, onPick) {
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      const dl = ensureAddressDatalist(inputId);
+      if (!dl) return;
+      addressSuggestState[inputId] = { items: [], timer: null, controller: null };
+      const render = (items) => {
+        dl.innerHTML = "";
+        (items || []).slice(0, 5).forEach((r) => {
+          if (!r || !r.display_name) return;
+          const op = document.createElement("option");
+          op.value = String(r.display_name);
+          dl.appendChild(op);
+        });
+      };
+      const maybePick = () => {
+        const state = addressSuggestState[inputId] || {};
+        const value = String(input.value || "").trim();
+        if (!value) return;
+        const picked = (state.items || []).find((r) => String(r.display_name || "") === value);
+        if (picked && typeof onPick === "function") onPick(picked);
+      };
+      const search = async () => {
+        const q = String(input.value || "").trim();
+        if (q.length < 4) {
+          addressSuggestState[inputId].items = [];
+          render([]);
+          return;
+        }
+        try {
+          const state = addressSuggestState[inputId];
+          if (state.controller) {
+            try { state.controller.abort(); } catch (_e) {}
+          }
+          state.controller = new AbortController();
+          const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}&_=${Date.now()}`, {
+            cache: "no-store",
+            signal: state.controller.signal,
+          });
+          const data = await res.json();
+          const items = Array.isArray(data.results) ? data.results : [];
+          state.items = items;
+          render(items);
+        } catch (_e) {
+          addressSuggestState[inputId].items = [];
+          render([]);
+        }
+      };
+      input.addEventListener("input", () => {
+        const state = addressSuggestState[inputId];
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(search, 220);
+      });
+      input.addEventListener("change", maybePick);
+      input.addEventListener("blur", maybePick);
+    }
+
     function initSiteMapAddressStepFields() {
       const street = document.getElementById("siteAddrStreet");
       const zip = document.getElementById("siteAddrZip");
       const state = document.getElementById("siteAddrState");
       const findBtn = document.getElementById("siteMapFindBtn");
+      initAddressAutocomplete("siteAddrStreet", (picked) => {
+        const a = String((picked && picked.display_name) || "").trim();
+        if (!a) return;
+        const streetEl = document.getElementById("siteAddrStreet");
+        const hiddenEl = document.getElementById("siteAddress");
+        const stateEl = document.getElementById("siteAddrState");
+        const zipEl = document.getElementById("siteAddrZip");
+        if (streetEl) streetEl.value = a;
+        if (hiddenEl) hiddenEl.value = a;
+        const parsed = parseStateZipFromAddressText(a);
+        if (stateEl && parsed.state) stateEl.value = parsed.state;
+        if (zipEl && parsed.zip) zipEl.value = parsed.zip;
+      });
       if (street) street.addEventListener("keydown", (e) => {
         if (e.key !== "Enter") return;
         e.preventDefault();
@@ -4668,6 +5069,7 @@ HTML = """<!doctype html>
       const svg = document.getElementById("mainMapPreviewSvg");
       const legend = document.getElementById("mainMapPreviewLegend");
       const note = document.getElementById("mainMapPreviewNote");
+      const editBtn = document.getElementById("mainMapPreviewEditBtn");
       const editZonesBtn = document.getElementById("mainMapPreviewEditZonesBtn");
       if (!sec || !svg || !legend || !note) return;
       if (editZonesBtn) {
@@ -4680,13 +5082,15 @@ HTML = """<!doctype html>
       const outline = cfg && cfg.building_outline;
       const pins = (cfg && cfg.pins && typeof cfg.pins === "object") ? cfg.pins : {};
       if (!outline || !Array.isArray(outline.coordinates) || !Array.isArray(outline.coordinates[0]) || outline.coordinates[0].length < 3) {
+        if (editBtn) editBtn.textContent = "Set Up Building Map";
         sec.classList.remove("hidden");
         svg.innerHTML = `<rect x="0" y="0" width="1000" height="560" fill="#fbfdff"/><text x="500" y="260" text-anchor="middle" font-size="24" font-weight="800" fill="#0f172a">Building Map Preview Unavailable</text><text x="500" y="294" text-anchor="middle" font-size="15" fill="#475569">No saved building outline was found.</text><text x="500" y="320" text-anchor="middle" font-size="15" fill="#475569">Use Edit Building Map to restore or redraw the building outline.</text>`;
         legend.innerHTML = `<span class="chip"><span class="sw" style="background:#ffffff;border-color:#0f172a"></span>No saved building outline</span>`;
-        note.textContent = "Click 'Edit Building Map' to open Building Setup and save a building outline. The preview will return after the outline is saved.";
+        note.textContent = "Click 'Set Up Building Map' to open Building Setup and save a building outline. The preview will return after the outline is saved.";
         mainMapPreviewLastRenderKey = "__hidden__";
         return;
       }
+      if (editBtn) editBtn.textContent = "Edit Building Map";
       sec.classList.remove("hidden");
 
       const ring = outline.coordinates[0]
@@ -5307,8 +5711,18 @@ HTML = """<!doctype html>
       return `${titleCase} Heating Hub`;
     }
 
+    function activeBuildingProfile() {
+      const cfg = buildingsCache || {};
+      const active = String(cfg.active_building_id || "").trim();
+      const rows = Array.isArray(cfg.buildings) ? cfg.buildings : [];
+      return rows.find((b) => String((b && b.id) || "") === active) || null;
+    }
+
     function refreshHubBranding() {
-      const titleText = formatHubTitleFromAddress(siteMapConfig && siteMapConfig.address);
+      const activeB = activeBuildingProfile();
+      const titleText = (activeB && String(activeB.name || "").trim())
+        ? `${String(activeB.name).trim()} Heating Hub`
+        : formatHubTitleFromAddress(siteMapConfig && siteMapConfig.address);
       const h1 = document.getElementById("hubTitle");
       if (h1) h1.textContent = titleText;
       try { document.title = titleText; } catch (_e) {}
@@ -6855,6 +7269,10 @@ HTML = """<!doctype html>
       const el = document.getElementById("usersMsg");
       if (el) el.textContent = msg || "";
     }
+    function setBuildingsMsg(msg) {
+      const el = document.getElementById("buildingsMsg");
+      if (el) el.textContent = msg || "";
+    }
     function setAdoptMsg(msg) {
       const el = document.getElementById("adoptMsg");
       if (el) el.textContent = msg || "";
@@ -6878,6 +7296,16 @@ HTML = """<!doctype html>
     function setBackupMsg(msg) {
       const el = document.getElementById("backupMsg");
       if (el) el.textContent = msg || "";
+    }
+    function toggleBuildingsPanel() {
+      const panel = document.getElementById("adminBuildingsPanel");
+      if (!panel) return;
+      const show = panel.classList.contains("hidden");
+      panel.classList.toggle("hidden", !show);
+      if (show) {
+        loadBuildings();
+        panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
     }
 
     function setAdminTab(which) {
@@ -7420,6 +7848,205 @@ HTML = """<!doctype html>
       }
     }
 
+    function fillBuildingForm(b) {
+      const x = b || {};
+      document.getElementById("buildingName").value = x.name || "";
+      document.getElementById("buildingAddress").value = x.address || "";
+      document.getElementById("buildingHubUrl").value = x.hub_url || "";
+      document.getElementById("buildingNotes").value = x.notes || "";
+      document.getElementById("saveBuildingBtn").dataset.editingId = x.id || "";
+    }
+
+    function clearBuildingForm() {
+      fillBuildingForm({ id: "", name: "", address: "", hub_url: "", notes: "" });
+      document.getElementById("saveBuildingBtn").dataset.editingId = "";
+    }
+
+    function renderBuildingSwitcher() {
+      const sel = document.getElementById("buildingSwitcher");
+      if (!sel) return;
+      const cfg = buildingsCache || {};
+      const list = Array.isArray(cfg.buildings) ? cfg.buildings : [];
+      const active = String(cfg.active_building_id || "local");
+      sel.innerHTML = "";
+      list.forEach((b) => {
+        const op = document.createElement("option");
+        op.value = String(b.id || "");
+        const n = String(b.name || b.id || "Building");
+        const a = String(b.address || "");
+        op.textContent = a ? `${n} (${a})` : n;
+        sel.appendChild(op);
+      });
+      const addOpt = document.createElement("option");
+      addOpt.value = BUILDING_SWITCH_ADD_VALUE;
+      addOpt.textContent = "+ Add Building...";
+      sel.appendChild(addOpt);
+      if (Array.from(sel.options).some((o) => o.value === active)) sel.value = active;
+    }
+
+    function renderBuildings(rows) {
+      const body = document.getElementById("buildingsBody");
+      if (!body) return;
+      const cfg = buildingsCache || {};
+      const active = String(cfg.active_building_id || "local");
+      const items = Array.isArray(rows) ? rows : [];
+      body.innerHTML = "";
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="5">No buildings configured.</td></tr>';
+        return;
+      }
+      items.forEach((b) => {
+        const tr = document.createElement("tr");
+        const bid = String(b.id || "");
+        const current = bid === active;
+        tr.innerHTML = `
+          <td>${b.name || "--"}${current ? ' <span class="smallnote">(Active)</span>' : ""}</td>
+          <td>${b.address || "--"}</td>
+          <td>${b.hub_url || "--"}</td>
+          <td>${b.notes || "--"}</td>
+          <td></td>
+        `;
+        const td = tr.lastElementChild;
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "btn";
+        editBtn.style.padding = "4px 10px";
+        editBtn.textContent = "Edit";
+        editBtn.addEventListener("click", () => {
+          fillBuildingForm(b);
+          setAdminTab("buildings");
+          setBuildingsMsg(`Editing ${b.name || b.id}`);
+        });
+        td.appendChild(editBtn);
+
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "btn";
+        openBtn.style.padding = "4px 10px";
+        openBtn.style.marginLeft = "6px";
+        openBtn.textContent = "Open";
+        openBtn.addEventListener("click", async () => {
+          await selectBuilding(bid, true);
+        });
+        td.appendChild(openBtn);
+
+        if (bid !== "local") {
+          const delBtn = document.createElement("button");
+          delBtn.type = "button";
+          delBtn.className = "btn";
+          delBtn.style.padding = "4px 10px";
+          delBtn.style.marginLeft = "6px";
+          delBtn.textContent = "Delete";
+          delBtn.addEventListener("click", async () => {
+            if (!confirm(`Delete building '${b.name || b.id}'?`)) return;
+            try {
+              const res = await fetch("/api/buildings/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: bid })
+              });
+              const data = await res.json();
+              if (!res.ok || data.error) throw new Error(data.error || "delete failed");
+              buildingsCache = data || { active_building_id: "local", buildings: [] };
+              renderBuildingSwitcher();
+              renderBuildings(buildingsCache.buildings || []);
+              setBuildingsMsg("Building deleted.");
+            } catch (e) {
+              setBuildingsMsg("Delete failed: " + e.message);
+            }
+          });
+          td.appendChild(delBtn);
+        }
+        body.appendChild(tr);
+      });
+    }
+
+    async function loadBuildings() {
+      try {
+        const res = await fetch(`/api/buildings?_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        buildingsCache = data || { active_building_id: "local", buildings: [] };
+        renderBuildingSwitcher();
+        renderBuildings(buildingsCache.buildings || []);
+        refreshHubBranding();
+      } catch (e) {
+        setBuildingsMsg("Failed to load buildings.");
+      }
+    }
+
+    async function saveBuilding() {
+      const editingId = document.getElementById("saveBuildingBtn").dataset.editingId || "";
+      const payload = {
+        id: editingId,
+        name: document.getElementById("buildingName").value.trim(),
+        address: document.getElementById("buildingAddress").value.trim(),
+        hub_url: document.getElementById("buildingHubUrl").value.trim(),
+        notes: document.getElementById("buildingNotes").value.trim(),
+      };
+      if (!payload.name) { setBuildingsMsg("Building Name is required."); return; }
+      if (!payload.hub_url) { setBuildingsMsg("Hub URL is required."); return; }
+      setBuildingsMsg("Saving building...");
+      try {
+        const res = await fetch("/api/buildings/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "save failed");
+        buildingsCache = data || { active_building_id: "local", buildings: [] };
+        renderBuildingSwitcher();
+        renderBuildings(buildingsCache.buildings || []);
+        clearBuildingForm();
+        setBuildingsMsg("Building saved.");
+      } catch (e) {
+        setBuildingsMsg("Save failed: " + e.message);
+      }
+    }
+
+    async function selectBuilding(buildingId, openAfterSelect = false) {
+      const bid = String(buildingId || "").trim();
+      if (!bid) return;
+      try {
+        const res = await fetch("/api/buildings/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: bid }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "select failed");
+        buildingsCache = data || buildingsCache;
+        renderBuildingSwitcher();
+        renderBuildings(buildingsCache.buildings || []);
+        refreshHubBranding();
+        const sel = document.getElementById("buildingSwitcher");
+        if (sel) sel.value = bid;
+        const selected = (buildingsCache.buildings || []).find((b) => String(b.id || "") === bid);
+        if (openAfterSelect && selected && selected.hub_url) {
+          const current = String(window.location.origin || "").replace(/\/$/, "");
+          const target = String(selected.hub_url || "").replace(/\/$/, "");
+          if (target && target !== current) {
+            window.location.href = target;
+            return;
+          }
+        }
+        setBuildingsMsg("Building selected.");
+      } catch (e) {
+        setBuildingsMsg("Select failed: " + e.message);
+      }
+    }
+
+    async function openSelectedBuilding() {
+      const sel = document.getElementById("buildingSwitcher");
+      const bid = sel ? String(sel.value || "") : "";
+      if (!bid) return;
+      if (bid === BUILDING_SWITCH_ADD_VALUE) {
+        window.location.href = "/buildings/new";
+        return;
+      }
+      await selectBuilding(bid, true);
+    }
+
     function renderUsers(users) {
       usersCache = Array.isArray(users) ? users : [];
       const body = document.getElementById("usersBody");
@@ -7724,6 +8351,9 @@ HTML = """<!doctype html>
       const tasksBtn = document.getElementById("tasksPill");
       const adminBtn = document.getElementById("adminToolsPill");
       const addDeviceBtn = document.getElementById("addDevicePill");
+      const openBuildingBtn = document.getElementById("openBuildingBtn");
+      const manageBuildingsBtn = document.getElementById("manageBuildingsBtn");
+      const buildingSwitcher = document.getElementById("buildingSwitcher");
       if (tasksBtn) tasksBtn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -7776,6 +8406,19 @@ HTML = """<!doctype html>
         }
       });
       if (addDeviceBtn) addDeviceBtn.addEventListener("click", openSetupPanel);
+      if (openBuildingBtn) openBuildingBtn.addEventListener("click", openSelectedBuilding);
+      if (manageBuildingsBtn) manageBuildingsBtn.addEventListener("click", toggleBuildingsPanel);
+      if (buildingSwitcher) {
+        buildingSwitcher.addEventListener("change", () => {
+          const bid = String(buildingSwitcher.value || "");
+          if (!bid) return;
+          if (bid === BUILDING_SWITCH_ADD_VALUE) {
+            window.location.href = "/buildings/new";
+            return;
+          }
+          selectBuilding(bid, false);
+        });
+      }
     }
 
     function openBuildingMapEditorFromPreview() {
@@ -7882,6 +8525,7 @@ HTML = """<!doctype html>
     initOverviewTabs();
     initOpenGraphDelegation();
     initSiteMapAddressStepFields();
+    initAddressAutocomplete("buildingAddress");
     bindZoneInfoButtons();
     const firstZoneBtn = document.getElementById("firstZoneSetupBtn");
     if (firstZoneBtn) firstZoneBtn.addEventListener("click", openSetupPanel);
@@ -8050,6 +8694,8 @@ HTML = """<!doctype html>
     if (adoptLoadSetupBtn) adoptLoadSetupBtn.addEventListener("click", () => loadAdoptDeviceSetup());
     const adoptClearBtn = document.getElementById("adoptClearBtn");
     if (adoptClearBtn) adoptClearBtn.addEventListener("click", () => { clearAdoptForm(); setAdoptMsg(""); });
+    document.getElementById("saveBuildingBtn").addEventListener("click", saveBuilding);
+    document.getElementById("clearBuildingFormBtn").addEventListener("click", clearBuildingForm);
     document.getElementById("saveUserBtn").addEventListener("click", saveUser);
     document.getElementById("clearUserFormBtn").addEventListener("click", clearUserForm);
     document.getElementById("refreshAlertsBtn").addEventListener("click", loadAlertEvents);
@@ -8081,6 +8727,7 @@ HTML = """<!doctype html>
     document.getElementById("backupExportBtn").addEventListener("click", exportBackupJson);
     document.getElementById("backupRestoreBtn").addEventListener("click", restoreBackupJson);
     clearUserForm();
+    clearBuildingForm();
     updateCommissioningSummary();
     setAlertLogFilter("trouble");
     refreshMain();
@@ -8090,6 +8737,7 @@ HTML = """<!doctype html>
     refreshCycles();
     loadNotifications();
     loadUsers();
+    loadBuildings();
     loadAlertEvents();
     loadSiteMapConfig();
     setInterval(refreshMain, 3000);
@@ -8097,6 +8745,180 @@ HTML = """<!doctype html>
     setInterval(refreshHistory, 60000);
     setInterval(refreshCycles, 30000);
     setInterval(loadAlertEvents, 30000);
+  </script>
+</body>
+</html>
+"""
+
+BUILDING_NEW_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Add Building</title>
+  <style>
+    :root{
+      --bg:#f4f8fb;
+      --card:#ffffff;
+      --text:#102030;
+      --muted:#5b6f82;
+      --border:#d2dce5;
+      --btn:#0b6ea8;
+      --btnText:#ffffff;
+      --btnSecondary:#eef4f9;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Arial,sans-serif;background:var(--bg);color:var(--text)}
+    .wrap{max-width:760px;margin:24px auto;padding:0 14px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+    h1{margin:0 0 8px;font-size:1.35rem}
+    .muted{color:var(--muted);font-size:.92rem}
+    .grid{display:grid;grid-template-columns:1fr;gap:10px;margin-top:12px}
+    label{display:block;font-size:.84rem;font-weight:700;color:#2d455a;margin-bottom:4px}
+    input,textarea{
+      width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;
+      font:inherit;background:#fff;color:var(--text)
+    }
+    textarea{min-height:90px;resize:vertical}
+    .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .btn{
+      border:1px solid var(--border);border-radius:10px;padding:9px 12px;background:var(--btnSecondary);
+      color:var(--text);cursor:pointer;font-weight:700
+    }
+    .btn.primary{background:var(--btn);color:var(--btnText);border-color:var(--btn)}
+    #msg{margin-top:8px;font-size:.9rem;color:#0b6ea8;min-height:20px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Add Building</h1>
+      <div class="muted">Create a building dashboard entry, then jump into that building.</div>
+      <div class="grid">
+        <div>
+          <label for="name">Building Name</label>
+          <input id="name" type="text" placeholder="165 Water Street">
+        </div>
+        <div>
+          <label for="address">Address</label>
+          <input id="address" type="text" placeholder="165 Water Street, New York, NY 10038">
+        </div>
+        <div>
+          <label for="notes">Notes (optional)</label>
+          <textarea id="notes" placeholder="Optional notes"></textarea>
+        </div>
+      </div>
+      <div class="row">
+        <button id="saveBtn" type="button" class="btn primary">Save Building</button>
+        <button id="cancelBtn" type="button" class="btn">Cancel</button>
+      </div>
+      <div id="msg"></div>
+    </div>
+  </div>
+  <script>
+    const setMsg = (m) => {
+      const el = document.getElementById("msg");
+      if (el) el.textContent = m || "";
+    };
+    const toOrigin = (u) => String(u || "").replace(/\/+$/, "");
+    const addressSuggestState = { items: [], timer: null, controller: null };
+    const defaultHubUrl = toOrigin(window.location.origin);
+    function ensureAddressDatalist() {
+      const input = document.getElementById("address");
+      if (!input) return null;
+      const listId = "address_suggestions";
+      let dl = document.getElementById(listId);
+      if (!dl) {
+        dl = document.createElement("datalist");
+        dl.id = listId;
+        document.body.appendChild(dl);
+      }
+      input.setAttribute("list", listId);
+      return dl;
+    }
+    function initAddressAutocomplete() {
+      const input = document.getElementById("address");
+      const dl = ensureAddressDatalist();
+      if (!input || !dl) return;
+      const render = (items) => {
+        dl.innerHTML = "";
+        (items || []).slice(0, 5).forEach((r) => {
+          if (!r || !r.display_name) return;
+          const op = document.createElement("option");
+          op.value = String(r.display_name);
+          dl.appendChild(op);
+        });
+      };
+      const search = async () => {
+        const q = String(input.value || "").trim();
+        if (q.length < 4) {
+          addressSuggestState.items = [];
+          render([]);
+          return;
+        }
+        try {
+          if (addressSuggestState.controller) {
+            try { addressSuggestState.controller.abort(); } catch (_e) {}
+          }
+          addressSuggestState.controller = new AbortController();
+          const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}&_=${Date.now()}`, {
+            cache: "no-store",
+            signal: addressSuggestState.controller.signal,
+          });
+          const data = await res.json();
+          const items = Array.isArray(data.results) ? data.results : [];
+          addressSuggestState.items = items;
+          render(items);
+        } catch (_e) {
+          addressSuggestState.items = [];
+          render([]);
+        }
+      };
+      input.addEventListener("input", () => {
+        if (addressSuggestState.timer) clearTimeout(addressSuggestState.timer);
+        addressSuggestState.timer = setTimeout(search, 220);
+      });
+    }
+    initAddressAutocomplete();
+    document.getElementById("cancelBtn").addEventListener("click", () => {
+      window.location.href = "/";
+    });
+    document.getElementById("saveBtn").addEventListener("click", async () => {
+      const payload = {
+        name: String(document.getElementById("name").value || "").trim(),
+        address: String(document.getElementById("address").value || "").trim(),
+        hub_url: defaultHubUrl,
+        notes: String(document.getElementById("notes").value || "").trim(),
+      };
+      if (!payload.name) { setMsg("Building Name is required."); return; }
+      setMsg("Saving building...");
+      try {
+        const saveRes = await fetch("/api/buildings/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const saveData = await saveRes.json();
+        if (!saveRes.ok || saveData.error) throw new Error(saveData.error || "save failed");
+        const rows = Array.isArray(saveData.buildings) ? saveData.buildings : [];
+        const savedId = String(saveData.saved_id || "").trim();
+        const created = rows.find((b) => String((b && b.id) || "") === savedId);
+        if (!savedId || !created || !created.id) throw new Error("saved but could not identify building");
+        const selRes = await fetch("/api/buildings/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: savedId }),
+        });
+        const selData = await selRes.json();
+        if (!selRes.ok || selData.error) throw new Error(selData.error || "select failed");
+        setMsg("Building added. Redirecting...");
+        const target = toOrigin(created.hub_url);
+        const current = toOrigin(window.location.origin);
+        window.location.href = (target && target !== current) ? target : "/";
+      } catch (e) {
+        setMsg("Save failed: " + e.message);
+      }
+    });
   </script>
 </body>
 </html>
@@ -8113,6 +8935,16 @@ class H(BaseHTTPRequestHandler):
             b = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/buildings/new":
+            b = BUILDING_NEW_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
@@ -8191,6 +9023,16 @@ class H(BaseHTTPRequestHandler):
 
         if route == "/api/users":
             b = json.dumps(public_users_config()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/buildings":
+            b = json.dumps(public_buildings_config()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -8464,6 +9306,9 @@ class H(BaseHTTPRequestHandler):
         if route not in (
             "/api/notifications",
             "/api/notifications/test-email",
+            "/api/buildings/save",
+            "/api/buildings/select",
+            "/api/buildings/delete",
             "/api/users/save",
             "/api/users/delete",
             "/api/alerts/ack",
@@ -8512,6 +9357,110 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+            return
+
+        if route == "/api/buildings/save":
+            cfg = load_buildings_config()
+            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+            requested_id = str(body.get("id") or "").strip().lower()
+            bid = requested_id
+            name = str(body.get("name") or "").strip()
+            address = str(body.get("address") or "").strip()
+            hub_url = normalize_hub_url(body.get("hub_url") or "")
+            notes = str(body.get("notes") or "").strip()
+            if not name:
+                b = json.dumps({"error": "name is required"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            if not hub_url:
+                b = json.dumps({"error": "hub_url is required"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            updated = False
+            if bid:
+                # Explicit id means edit existing entry.
+                for i, bld in enumerate(rows):
+                    if not isinstance(bld, dict):
+                        continue
+                    if str(bld.get("id") or "").strip().lower() == bid:
+                        rows[i] = {"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes}
+                        updated = True
+                        break
+                if not updated:
+                    b = json.dumps({"error": "building id not found for update"}).encode("utf-8")
+                    self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            else:
+                # No id means create a new building; always ensure unique id.
+                base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or f"building-{uuid.uuid4().hex[:8]}"
+                if base == "local":
+                    base = "building"
+                existing = {
+                    str(r.get("id") or "").strip().lower()
+                    for r in rows if isinstance(r, dict)
+                }
+                bid = base
+                n = 2
+                while bid in existing:
+                    bid = f"{base}-{n}"
+                    n += 1
+                rows.append({"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes})
+                try:
+                    init_building_state(bid, reset=True)
+                except Exception:
+                    pass
+            cfg["buildings"] = rows
+            if not cfg.get("active_building_id"):
+                cfg["active_building_id"] = "local"
+            if not save_buildings_config(cfg):
+                b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
+                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            out = public_buildings_config()
+            out["saved_id"] = bid
+            out["saved_name"] = name
+            out["created"] = (not updated)
+            b = json.dumps(out).encode("utf-8")
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+
+        if route == "/api/buildings/select":
+            bid = str(body.get("id") or "").strip().lower()
+            if not bid:
+                b = json.dumps({"error": "id is required"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            cfg = load_buildings_config()
+            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+            if not any(isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid for r in rows):
+                b = json.dumps({"error": "building not found"}).encode("utf-8")
+                self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            cfg["active_building_id"] = bid
+            if not save_buildings_config(cfg):
+                b = json.dumps({"error": "failed to save active building"}).encode("utf-8")
+                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            reset_runtime_state_for_building_switch()
+            refresh_downstream_cache()
+            b = json.dumps(public_buildings_config()).encode("utf-8")
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+
+        if route == "/api/buildings/delete":
+            bid = str(body.get("id") or "").strip().lower()
+            if not bid:
+                b = json.dumps({"error": "id is required"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            if bid == "local":
+                b = json.dumps({"error": "local building cannot be deleted"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            cfg = load_buildings_config()
+            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+            rows = [r for r in rows if not (isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid)]
+            cfg["buildings"] = rows
+            if str(cfg.get("active_building_id") or "").strip().lower() == bid:
+                cfg["active_building_id"] = "local"
+            if not save_buildings_config(cfg):
+                b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
+                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            reset_runtime_state_for_building_switch()
+            refresh_downstream_cache()
+            b = json.dumps(public_buildings_config()).encode("utf-8")
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
         if route == "/api/users/save":
