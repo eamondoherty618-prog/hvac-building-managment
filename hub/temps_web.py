@@ -3,6 +3,8 @@ import json
 import threading
 import smtplib
 import uuid
+import subprocess
+import re
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1200,6 +1202,104 @@ def save_config_zones(zones):
         return False
 
 
+def slugify_zone_id(text):
+    s = re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+    return s or f"zone-{uuid.uuid4().hex[:8]}"
+
+
+def normalize_zone_node_base_url(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    scheme = parsed.scheme or "http"
+    host = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+    host = host.rstrip("/")
+    if not host:
+        return ""
+    if not path or path == "/":
+        return f"{scheme}://{host}:8090".replace(":8090:8090", ":8090")
+    if path.endswith("/api/zone"):
+        return f"{scheme}://{host}{path[:-8]}".rstrip("/")
+    return f"{scheme}://{host}{path}".rstrip("/")
+
+
+def tailscale_peer_ips():
+    ips = []
+    try:
+        cp = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5)
+        if cp.returncode != 0:
+            return ips
+        data = json.loads(cp.stdout or "{}")
+        peers = data.get("Peer", {}) if isinstance(data, dict) else {}
+        if isinstance(peers, dict):
+            for _, p in peers.items():
+                if not isinstance(p, dict):
+                    continue
+                for ip in p.get("TailscaleIPs", []) or []:
+                    s = str(ip or "")
+                    if s.startswith("100."):
+                        ips.append(s)
+        self_info = data.get("Self", {}) if isinstance(data, dict) else {}
+        for ip in (self_info.get("TailscaleIPs", []) or []):
+            s = str(ip or "")
+            if s.startswith("100."):
+                ips.append(s)
+    except Exception:
+        return []
+    # preserve order, dedupe
+    out, seen = [], set()
+    for ip in ips:
+        if ip in seen:
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
+def discovered_zone_nodes():
+    adopted = {}
+    for z in load_config():
+        if not isinstance(z, dict):
+            continue
+        src = str(z.get("source_url") or "").strip()
+        base = normalize_zone_node_base_url(src.replace("/api/zone", ""))
+        if base:
+            adopted[base] = {"zone_id": str(z.get("id") or ""), "name": str(z.get("name") or "")}
+    rows = []
+    for ip in tailscale_peer_ips():
+        base = f"http://{ip}:8090"
+        setup, setup_err = fetch_remote_json(base + "/api/setup-state")
+        if not isinstance(setup, dict):
+            continue
+        cfg = setup.get("config", {}) if isinstance(setup.get("config"), dict) else {}
+        zone, zone_err = fetch_remote_json(base + "/api/zone")
+        zdict = zone if isinstance(zone, dict) else {}
+        rows.append({
+            "base_url": base,
+            "api_url": base + "/api/zone",
+            "ip": ip,
+            "configured": bool(setup.get("configured")),
+            "adopted": base in adopted,
+            "adopted_zone_id": adopted.get(base, {}).get("zone_id", ""),
+            "adopted_name": adopted.get(base, {}).get("name", ""),
+            "unit_name": str((zdict.get("unit_name") or cfg.get("unit_name") or "")).strip(),
+            "zone_id": str((zdict.get("zone_id") or cfg.get("zone_id") or "")).strip(),
+            "parent_zone": str((zdict.get("parent_zone") or cfg.get("parent_zone") or "Zone 1")).strip() or "Zone 1",
+            "supply_f": zdict.get("feed_f"),
+            "return_f": zdict.get("return_f"),
+            "call_status": zdict.get("call_status"),
+            "setup_error": setup_err,
+            "zone_error": zone_err,
+            "updated_utc": now_utc_iso(),
+        })
+    rows.sort(key=lambda r: (r.get("adopted", False), r.get("configured", False), (r.get("unit_name") or r.get("ip") or "").lower()))
+    return rows
+
+
 def zone_config_entry(zone_id):
     zid = str(zone_id or "").strip()
     if not zid:
@@ -1753,7 +1853,7 @@ HTML = """<!doctype html>
 <head>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>165 Water Street Heating Hub</title>
+  <title>Heating Hub</title>
   <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">
   <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" crossorigin=\"\"/>
   <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\" crossorigin=\"\"></script>
@@ -2008,7 +2108,7 @@ HTML = """<!doctype html>
   <div class=\"wrap\">
     <header class=\"head\" id=\"mainTop\">
       <div>
-        <h1>165 Water Street Heating Hub</h1>
+        <h1 id=\"hubTitle\">Heating Hub</h1>
         <div class=\"meta\">Main Boiler Zone(s) + Heating Zones</div>
       </div>
       <div style=\"display:flex;gap:8px;flex-wrap:wrap\">
@@ -2026,6 +2126,7 @@ HTML = """<!doctype html>
           <div id=\"adminToolsMenu\" class=\"head-menu\" role=\"menu\" aria-label=\"Admin Tools Menu\">
             <button type=\"button\" class=\"mitem\" id=\"adminMenuUsers\" role=\"menuitem\">Users<span class=\"sub\">Manage users, roles, and alert subscriptions</span></button>
             <button type=\"button\" class=\"mitem\" id=\"adminMenuAlerts\" role=\"menuitem\">Alarm Acknowledge<span class=\"sub\">Trouble log, alert log, acknowledgements</span></button>
+            <button type=\"button\" class=\"mitem\" id=\"adminMenuAdopt\" role=\"menuitem\">Adopt Devices<span class=\"sub\">Find unassigned zone nodes and add them to the hub</span></button>
             <button type=\"button\" class=\"mitem\" id=\"adminMenuZones\" role=\"menuitem\">Zone Management<span class=\"sub\">Post-install zone edits and diagnostics</span></button>
             <button type=\"button\" class=\"mitem\" id=\"adminMenuMap\" role=\"menuitem\">Site Map<span class=\"sub\">Building setup and zone mapping</span></button>
             <button type=\"button\" class=\"mitem\" id=\"adminMenuSetup\" role=\"menuitem\">Setup New Device<span class=\"sub\">Installer onboarding and hub link</span></button>
@@ -2103,6 +2204,7 @@ HTML = """<!doctype html>
       <div class=\"tabs\" id=\"adminTabs\" style=\"margin-top:10px\">
         <button class=\"tab active\" data-admin-tab=\"users\">Users</button>
         <button class=\"tab\" data-admin-tab=\"alerts\">Alarm Acknowledge</button>
+        <button class=\"tab\" data-admin-tab=\"adopt\">Adopt Devices</button>
         <button class=\"tab\" data-admin-tab=\"zones\">Zone Management</button>
         <button class=\"tab\" data-admin-tab=\"commissioning\">Commissioning</button>
         <button class=\"tab\" data-admin-tab=\"backup\">Backup / Restore</button>
@@ -2321,6 +2423,101 @@ HTML = """<!doctype html>
         </div>
       </div>
 
+      <div id=\"adminAdoptPanel\" class=\"hidden\" style=\"margin-top:12px\">
+        <div class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
+          <h4 style=\"margin:0 0 8px\">Unassigned Devices (Tailscale)</h4>
+          <div class=\"smallnote\">Scans Tailscale peers for zone nodes on <code>:8090</code>. Adopt a configured node to add it to the hub and assign a parent zone.</div>
+          <div class=\"form-grid\" style=\"margin-top:10px\">
+            <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+              <button type=\"button\" class=\"btn\" id=\"adoptScanBtn\">Scan for Zone Nodes</button>
+              <button type=\"button\" class=\"btn\" id=\"adoptRefreshBtn\">Refresh List</button>
+            </div>
+          </div>
+          <div id=\"adoptMsg\" class=\"msg\"></div>
+          <div class=\"table-responsive\" style=\"margin-top:10px\">
+            <table class=\"table table-hover align-middle mb-0\">
+              <thead><tr><th>Device</th><th>IP</th><th>Status</th><th>Parent</th><th>Supply / Return</th><th>Call</th><th>Actions</th></tr></thead>
+              <tbody id=\"adoptDevicesBody\"></tbody>
+            </table>
+          </div>
+          <div class=\"form-grid\" style=\"margin-top:12px;border-top:1px solid var(--border);padding-top:12px\">
+            <div class=\"full\"><strong>Adopt Selected Device</strong></div>
+            <div class=\"full smallnote\">Fields marked with * are required before adoption.</div>
+            <div>
+              <label class=\"label\" for=\"adoptBaseUrl\">Device URL *</label>
+              <input id=\"adoptBaseUrl\" class=\"input\" placeholder=\"http://100.x.x.x:8090\" readonly>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptName\">Display Name *</label>
+              <input id=\"adoptName\" class=\"input\" placeholder=\"Production Area Heating Coil 1\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptZoneId\">Zone ID *</label>
+              <input id=\"adoptZoneId\" class=\"input\" placeholder=\"zone1-production-area-heating-coil-1\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptParentZone\">Parent Zone *</label>
+              <select id=\"adoptParentZone\" class=\"select\">
+                <option>Zone 1</option>
+                <option>Zone 2</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptSupplyProbe\">Supply Probe *</label>
+              <select id=\"adoptSupplyProbe\" class=\"select\">
+                <option value=\"\">Load device setup first</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptReturnProbe\">Return Probe *</label>
+              <select id=\"adoptReturnProbe\" class=\"select\">
+                <option value=\"\">Load device setup first</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptWifiSsid\">Wi-Fi Name *</label>
+              <input id=\"adoptWifiSsid\" class=\"input\" placeholder=\"Building Wi-Fi SSID\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptWifiPassword\">Wi-Fi Password *</label>
+              <input id=\"adoptWifiPassword\" class=\"input\" type=\"password\" placeholder=\"Building Wi-Fi password\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptHubUrl\">Hub URL *</label>
+              <input id=\"adoptHubUrl\" class=\"input\" placeholder=\"https://your-hub.example.com\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptLowTempEnabled\">Low Temp Alerts</label>
+              <select id=\"adoptLowTempEnabled\" class=\"select\">
+                <option value=\"true\">Enabled</option>
+                <option value=\"false\">Disabled</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptLowTempThreshold\">Low Temp Threshold (F)</label>
+              <input id=\"adoptLowTempThreshold\" class=\"input\" type=\"number\" step=\"0.5\" min=\"0\" value=\"35\">
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptCallSensingEnabled\">24VAC Sensing</label>
+              <select id=\"adoptCallSensingEnabled\" class=\"select\">
+                <option value=\"true\">Enabled</option>
+                <option value=\"false\">Disabled</option>
+              </select>
+            </div>
+            <div>
+              <label class=\"label\" for=\"adoptDeltaOk\">Supply/Return Match Threshold (F)</label>
+              <input id=\"adoptDeltaOk\" class=\"input\" type=\"number\" step=\"0.5\" min=\"0\" value=\"8\">
+            </div>
+            <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
+              <button type=\"button\" class=\"btn\" id=\"adoptLoadSetupBtn\">Load Device Setup</button>
+              <button type=\"button\" class=\"btn active\" id=\"adoptSaveBtn\">Adopt Device</button>
+              <button type=\"button\" class=\"btn\" id=\"adoptClearBtn\">Clear Selection</button>
+            </div>
+            <div id=\"adoptConfirm\" class=\"full smallnote hidden\" style=\"border:1px solid #86efac;background:#f0fdf4;color:#166534;padding:8px;border-radius:8px\"></div>
+          </div>
+        </div>
+      </div>
+
       <div id=\"adminZonesPanel\" class=\"hidden\" style=\"margin-top:12px\">
         <div id=\"zoneMgmtCard\" class=\"card\" style=\"padding:12px;border-radius:12px;border:1px solid var(--border);background:#f9fcfe;box-shadow:none\">
           <h4 style=\"margin:0 0 8px\">Zone Management (Adopted Devices)</h4>
@@ -2357,6 +2554,7 @@ HTML = """<!doctype html>
             </div>
             <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
               <button type=\"button\" class=\"btn active\" id=\"zoneMgmtSaveBtn\">Save Zone Changes</button>
+              <button type=\"button\" class=\"btn\" id=\"zoneMgmtEraseBtn\" style=\"border-color:#fecaca;color:#991b1b;background:#fff5f5\">Erase Zone</button>
             </div>
             <div class=\"full\">
               <details style=\"border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff\">
@@ -2369,6 +2567,13 @@ HTML = """<!doctype html>
                   <div>
                     <label class=\"label\" for=\"zoneMgmtLowTempEnabled\">Low Temp Alerts</label>
                     <select id=\"zoneMgmtLowTempEnabled\" class=\"select\">
+                      <option value=\"true\">Enabled</option>
+                      <option value=\"false\">Disabled</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class=\"label\" for=\"zoneMgmtCallSensingEnabled\">24VAC Sensing</label>
+                    <select id=\"zoneMgmtCallSensingEnabled\" class=\"select\">
                       <option value=\"true\">Enabled</option>
                       <option value=\"false\">Disabled</option>
                     </select>
@@ -4323,6 +4528,8 @@ HTML = """<!doctype html>
       ds.forEach((z) => {
         const card = document.createElement("div");
         card.className = "overview-card";
+        const zoneId = String(z.id || "");
+        const zoneIdJs = zoneId.replace(/'/g, "\\'");
         const status = z.zone_status || z.status || "--";
         const note = z.status_note || "";
         const statusCls = statusClass(z.status);
@@ -4332,15 +4539,19 @@ HTML = """<!doctype html>
               <div class="t">${z.name || z.id || "--"}</div>
               <div class="s">${z.id || ""}</div>
             </div>
-            <button type="button" class="btn" style="padding:4px 10px">Open Graph</button>
+            <button type="button" class="btn" data-open-graph-tab="ds_${zoneId}" data-open-graph-cycle="${zoneId}" onclick="focusZoneGraph('ds_${zoneIdJs}','${zoneIdJs}'); return false;" style="padding:4px 10px">Open Graph</button>
           </div>
           <div class="line">Call: ${z.call_status || (z.heating_call === true ? "24VAC Present (Calling)" : (z.heating_call === false ? "No 24VAC (Idle)" : "24VAC Signal Unknown"))}</div>
           <div class="line">Supply: ${fmtTemp(z.feed_f)} · Return: ${fmtTemp(z.return_f)}</div>
           <div class="line ${statusCls}">Status: ${status}</div>
           ${note ? `<div class="line s">Note: ${note}</div>` : ""}
         `;
-        const btn = card.querySelector("button");
-        if (btn) btn.addEventListener("click", () => focusZoneGraph("ds_" + (z.id || ""), z.id || ""));
+        const btn = card.querySelector("button[data-open-graph-tab]");
+        if (btn) {
+          btn.addEventListener("click", () => {
+            focusZoneGraph(btn.dataset.openGraphTab || ("ds_" + (z.id || "")), btn.dataset.openGraphCycle || (z.id || ""));
+          });
+        }
         cardsEl.appendChild(card);
       });
       if (ds.length === 1) {
@@ -5000,6 +5211,29 @@ HTML = """<!doctype html>
       return out;
     }
 
+    function formatHubTitleFromAddress(addr) {
+      const base = "Heating Hub";
+      const raw = String(addr || "").trim();
+      if (!raw) return base;
+      const cleaned = raw.replace(/\s+/g, " ").trim();
+      if (!cleaned) return base;
+      const titleCase = cleaned
+        .split(" ")
+        .map((part) => {
+          if (!part) return part;
+          return part.charAt(0).toUpperCase() + part.slice(1);
+        })
+        .join(" ");
+      return `${titleCase} Heating Hub`;
+    }
+
+    function refreshHubBranding() {
+      const titleText = formatHubTitleFromAddress(siteMapConfig && siteMapConfig.address);
+      const h1 = document.getElementById("hubTitle");
+      if (h1) h1.textContent = titleText;
+      try { document.title = titleText; } catch (_e) {}
+    }
+
     function refreshSiteMapZoneSelect() {
       const sel = document.getElementById("siteMapZoneSelect");
       if (!sel) return;
@@ -5136,6 +5370,7 @@ HTML = """<!doctype html>
       if (equipEl) {
         equipEl.placeholder = main ? "Circulator pump / Boiler loop pump" : "Fan coil / Unit heater / Air handler coil";
       }
+      refreshHubBranding();
     }
 
     function getSiteMapPin(zoneId) {
@@ -6499,10 +6734,10 @@ HTML = """<!doctype html>
     }
 
     function initButtons() {
-      document.querySelectorAll(".btn").forEach((btn) => {
+      document.querySelectorAll(".btn[data-range]").forEach((btn) => {
         btn.addEventListener("click", () => {
           activeRange = btn.dataset.range;
-          document.querySelectorAll(".btn").forEach((b) => b.classList.remove("active"));
+          document.querySelectorAll(".btn[data-range]").forEach((b) => b.classList.remove("active"));
           btn.classList.add("active");
           refreshHistory();
         });
@@ -6540,6 +6775,10 @@ HTML = """<!doctype html>
       const el = document.getElementById("usersMsg");
       if (el) el.textContent = msg || "";
     }
+    function setAdoptMsg(msg) {
+      const el = document.getElementById("adoptMsg");
+      if (el) el.textContent = msg || "";
+    }
     function setAlertsMsg(msg) {
       const el = document.getElementById("alertsMsg");
       if (el) el.textContent = msg || "";
@@ -6566,6 +6805,7 @@ HTML = """<!doctype html>
       document.querySelectorAll("[data-admin-tab]").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === which));
       document.getElementById("adminUsersPanel").classList.toggle("hidden", which !== "users");
       document.getElementById("adminAlertsPanel").classList.toggle("hidden", which !== "alerts");
+      document.getElementById("adminAdoptPanel").classList.toggle("hidden", which !== "adopt");
       document.getElementById("adminZonesPanel").classList.toggle("hidden", which !== "zones");
       document.getElementById("adminCommissioningPanel").classList.toggle("hidden", which !== "commissioning");
       document.getElementById("adminBackupPanel").classList.toggle("hidden", which !== "backup");
@@ -6575,6 +6815,9 @@ HTML = """<!doctype html>
         refreshZoneMgmtSelect();
         const sel = document.getElementById("zoneMgmtSelect");
         if (sel && sel.value) loadZoneMgmtStatus(sel.value);
+      }
+      if (which === "adopt") {
+        loadAdoptDevices();
       }
       if (which === "map") {
         ensureSiteMapReady();
@@ -6590,6 +6833,7 @@ HTML = """<!doctype html>
       const m = {
         users: "adminUsersPanel",
         alerts: "adminAlertsPanel",
+        adopt: "adminAdoptPanel",
         zones: "adminZonesPanel",
         commissioning: "adminCommissioningPanel",
         backup: "adminBackupPanel",
@@ -6656,6 +6900,224 @@ HTML = """<!doctype html>
       return realDownstreamRows((lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : []);
     }
 
+    let adoptDevicesCache = [];
+
+    function slugifyClient(text) {
+      return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `zone-${Math.random().toString(16).slice(2, 8)}`;
+    }
+
+    function clearAdoptForm() {
+      const ids = ["adoptBaseUrl","adoptName","adoptZoneId","adoptWifiSsid","adoptWifiPassword","adoptHubUrl"];
+      ids.forEach((id) => { const el = document.getElementById(id); if (el) el.value = ""; });
+      const p = document.getElementById("adoptParentZone"); if (p) p.value = "Zone 1";
+      const d = document.getElementById("adoptDeltaOk"); if (d) d.value = "8";
+      const lt = document.getElementById("adoptLowTempThreshold"); if (lt) lt.value = "35";
+      const le = document.getElementById("adoptLowTempEnabled"); if (le) le.value = "true";
+      const cs = document.getElementById("adoptCallSensingEnabled"); if (cs) cs.value = "true";
+      const sp = document.getElementById("adoptSupplyProbe"); if (sp) sp.innerHTML = '<option value="">Load device setup first</option>';
+      const rp = document.getElementById("adoptReturnProbe"); if (rp) rp.innerHTML = '<option value="">Load device setup first</option>';
+      const ok = document.getElementById("adoptConfirm"); if (ok) { ok.classList.add("hidden"); ok.textContent = ""; }
+      const saveBtn = document.getElementById("adoptSaveBtn");
+      if (saveBtn) delete saveBtn.dataset.selectedBase;
+    }
+
+    function fillProbeSelect(selectId, choices, selectedValue) {
+      const sel = document.getElementById(selectId);
+      if (!sel) return;
+      sel.innerHTML = "";
+      if (!Array.isArray(choices) || !choices.length) {
+        sel.innerHTML = '<option value="">No probes detected</option>';
+        return;
+      }
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "-- Select Probe --";
+      sel.appendChild(blank);
+      choices.forEach((p, idx) => {
+        const sid = String((p && p.sensor_id) || "");
+        if (!sid) return;
+        const tf = (p && p.temp_f != null && Number.isFinite(Number(p.temp_f))) ? `${Number(p.temp_f).toFixed(1)}F` : "--";
+        const err = (p && p.error) ? ` • ${p.error}` : "";
+        const op = document.createElement("option");
+        op.value = sid;
+        op.textContent = `Temp Probe ${idx + 1} (${tf})${err}`;
+        sel.appendChild(op);
+      });
+      if (selectedValue && Array.from(sel.options).some((o) => o.value === selectedValue)) sel.value = selectedValue;
+    }
+
+    async function loadAdoptDeviceSetup(baseOverride) {
+      const base = (baseOverride || document.getElementById("adoptBaseUrl").value || "").trim();
+      if (!base) { setAdoptMsg("Select a discovered device first."); return; }
+      setAdoptMsg("Loading device setup...");
+      try {
+        const res = await fetch(`/api/device/setup-state?base_url=${encodeURIComponent(base)}&_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "setup load failed");
+        const setup = (data.setup_state && data.setup_state.config) || {};
+        const alerts = (setup && setup.alerts) || {};
+        const wifi = (setup && setup.wifi) || {};
+        const hub = (setup && setup.hub) || {};
+        fillProbeSelect("adoptSupplyProbe", data.probe_choices || [], setup.feed_sensor_id || "");
+        fillProbeSelect("adoptReturnProbe", data.probe_choices || [], setup.return_sensor_id || "");
+        document.getElementById("adoptWifiSsid").value = wifi.ssid || "";
+        document.getElementById("adoptHubUrl").value = hub.hub_url || window.location.origin;
+        document.getElementById("adoptLowTempThreshold").value = (alerts.low_temp_threshold_f ?? 35);
+        document.getElementById("adoptLowTempEnabled").value = (alerts.low_temp_enabled === false) ? "false" : "true";
+        document.getElementById("adoptCallSensingEnabled").value = (alerts.call_sensing_enabled === false) ? "false" : "true";
+        const pw = document.getElementById("adoptWifiPassword");
+        if (pw) pw.value = "";
+        setAdoptMsg("Device setup loaded. Fill required fields and click Adopt Device.");
+      } catch (e) {
+        setAdoptMsg("Setup load failed: " + e.message);
+      }
+    }
+
+    function fillAdoptFormFromDevice(dev) {
+      if (!dev) return;
+      const base = dev.base_url || "";
+      const name = dev.unit_name || dev.adopted_name || "";
+      document.getElementById("adoptBaseUrl").value = base;
+      document.getElementById("adoptName").value = name;
+      document.getElementById("adoptParentZone").value = dev.parent_zone || "Zone 1";
+      const suggested = dev.zone_id || slugifyClient(`${dev.parent_zone || "zone1"}-${name || dev.ip || "device"}`);
+      document.getElementById("adoptZoneId").value = suggested;
+      document.getElementById("adoptDeltaOk").value = "8";
+      document.getElementById("adoptSaveBtn").dataset.selectedBase = base;
+      setAdoptMsg(`Selected ${name || dev.ip || "device"} for adoption.`);
+      loadAdoptDeviceSetup(base);
+    }
+
+    function renderAdoptDevices(devices) {
+      adoptDevicesCache = Array.isArray(devices) ? devices : [];
+      const body = document.getElementById("adoptDevicesBody");
+      if (!body) return;
+      body.innerHTML = "";
+      if (!adoptDevicesCache.length) {
+        body.innerHTML = '<tr><td colspan="7">No zone nodes found on Tailscale yet.</td></tr>';
+        return;
+      }
+      adoptDevicesCache.forEach((d) => {
+        const tr = document.createElement("tr");
+        const statusBits = [];
+        statusBits.push(d.configured ? "Configured" : "Setup Required");
+        if (d.adopted) statusBits.push(`Adopted (${d.adopted_zone_id || "--"})`);
+        if (d.zone_error) statusBits.push("Zone API issue");
+        const sup = (d.supply_f == null ? "--" : `${Number(d.supply_f).toFixed(1)}°F`);
+        const ret = (d.return_f == null ? "--" : `${Number(d.return_f).toFixed(1)}°F`);
+        tr.innerHTML = `
+          <td>${d.unit_name || "--"}</td>
+          <td>${d.ip || "--"}</td>
+          <td>${statusBits.join(" • ")}</td>
+          <td>${d.parent_zone || "--"}</td>
+          <td>${sup} / ${ret}</td>
+          <td>${d.call_status || "--"}</td>
+          <td></td>
+        `;
+        const td = tr.lastElementChild;
+        if (!d.adopted) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "btn";
+          btn.style.padding = "4px 10px";
+          btn.textContent = d.configured ? "Adopt" : "Prepare";
+          btn.addEventListener("click", () => {
+            fillAdoptFormFromDevice(d);
+            if (!d.configured) setAdoptMsg("Device is not fully configured yet. Finish zone-node setup first, then adopt it here.");
+          });
+          td.appendChild(btn);
+        } else {
+          td.textContent = "—";
+        }
+      });
+    }
+
+    async function loadAdoptDevices() {
+      setAdoptMsg("Scanning Tailscale for zone nodes...");
+      try {
+        const res = await fetch(`/api/devices/discover?_=${Date.now()}`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "discover failed");
+        renderAdoptDevices(data.devices || []);
+        const unadopted = (data.devices || []).filter((d) => !d.adopted).length;
+        setAdoptMsg(`Scan complete. ${unadopted} device(s) available to adopt.`);
+      } catch (e) {
+        setAdoptMsg("Scan failed: " + e.message);
+      }
+    }
+
+    async function adoptSelectedDevice() {
+      const base = (document.getElementById("adoptBaseUrl").value || "").trim();
+      const name = (document.getElementById("adoptName").value || "").trim();
+      const zoneId = (document.getElementById("adoptZoneId").value || "").trim();
+      const parentZone = document.getElementById("adoptParentZone").value || "Zone 1";
+      const deltaOk = Number(document.getElementById("adoptDeltaOk").value || 8);
+      const supplyProbe = (document.getElementById("adoptSupplyProbe").value || "").trim();
+      const returnProbe = (document.getElementById("adoptReturnProbe").value || "").trim();
+      const wifiSsid = (document.getElementById("adoptWifiSsid").value || "").trim();
+      const wifiPassword = (document.getElementById("adoptWifiPassword").value || "");
+      const hubUrl = (document.getElementById("adoptHubUrl").value || "").trim();
+      const lowTempEnabled = document.getElementById("adoptLowTempEnabled").value === "true";
+      const lowTempThresholdF = Number(document.getElementById("adoptLowTempThreshold").value || 35);
+      const callSensingEnabled = document.getElementById("adoptCallSensingEnabled").value === "true";
+      const missing = [];
+      if (!base) missing.push("Device URL");
+      if (!name) missing.push("Display Name");
+      if (!zoneId) missing.push("Zone ID");
+      if (!parentZone) missing.push("Parent Zone");
+      if (!supplyProbe) missing.push("Supply Probe");
+      if (!returnProbe) missing.push("Return Probe");
+      if (!wifiSsid) missing.push("Wi-Fi Name");
+      if (!wifiPassword) missing.push("Wi-Fi Password");
+      if (!hubUrl) missing.push("Hub URL");
+      if (missing.length) { setAdoptMsg(`Required fields missing: ${missing.join(", ")}`); return; }
+      if (supplyProbe === returnProbe) { setAdoptMsg("Supply Probe and Return Probe must be different."); return; }
+      if (!Number.isFinite(deltaOk) || deltaOk < 0) { setAdoptMsg("Supply/Return Match Threshold must be a valid number."); return; }
+      if (!Number.isFinite(lowTempThresholdF) || lowTempThresholdF < 0) { setAdoptMsg("Low Temp Threshold must be a valid number."); return; }
+      setAdoptMsg("Adopting device...");
+      try {
+        const res = await fetch("/api/devices/adopt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_url: base,
+            name,
+            zone_id: zoneId,
+            parent_zone: parentZone,
+            delta_ok_f: deltaOk,
+            setup: {
+              unit_name: name,
+              zone_id: zoneId,
+              parent_zone: parentZone,
+              feed_sensor_id: supplyProbe,
+              return_sensor_id: returnProbe,
+              wifi: { ssid: wifiSsid, password: wifiPassword },
+              hub: { hub_url: hubUrl },
+              alerts: {
+                low_temp_enabled: lowTempEnabled,
+                low_temp_threshold_f: lowTempThresholdF,
+                call_sensing_enabled: callSensingEnabled,
+              },
+            },
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "adopt failed");
+        setAdoptMsg(data.message || "Device adopted.");
+        clearAdoptForm();
+        const ok = document.getElementById("adoptConfirm");
+        if (ok) {
+          ok.textContent = `Adopted: ${name} | Zone ID: ${zoneId} | Parent: ${parentZone} | Device: ${base}`;
+          ok.classList.remove("hidden");
+        }
+        renderAdoptDevices(data.devices || []);
+        await refreshHub();
+        refreshZoneMgmtSelect();
+      } catch (e) {
+        setAdoptMsg("Adopt failed: " + e.message);
+      }
+    }
+
     function refreshZoneMgmtSelect() {
       const sel = document.getElementById("zoneMgmtSelect");
       if (!sel) return;
@@ -6690,6 +7152,7 @@ HTML = """<!doctype html>
       document.getElementById("zoneMgmtZoneId").value = zcfg.id || cfg.zone_id || "";
       document.getElementById("zoneMgmtLowTemp").value = (nodeZone.low_temp_threshold_f ?? ((cfg.alerts || {}).low_temp_threshold_f ?? 35));
       document.getElementById("zoneMgmtLowTempEnabled").value = ((nodeZone.low_temp_enabled ?? ((cfg.alerts || {}).low_temp_enabled)) === false) ? "false" : "true";
+      document.getElementById("zoneMgmtCallSensingEnabled").value = ((diag.call_sensing_enabled ?? ((cfg.alerts || {}).call_sensing_enabled)) === false) ? "false" : "true";
       document.getElementById("zoneMgmtProbeSwapDelta").value = ((diag.probe_swap_idle_delta_threshold_f ?? ((cfg.alerts || {}).probe_swap_idle_delta_threshold_f)) ?? 5);
       document.getElementById("zoneMgmtProbeSummary").textContent = `Supply: ${nodeZone.feed_sensor_id || "--"} (${nodeZone.feed_f ?? "--"}F) | Return: ${nodeZone.return_sensor_id || "--"} (${nodeZone.return_f ?? "--"}F)`;
       const diagErr = data && (data.node_zone_error || data.node_setup_error);
@@ -6752,6 +7215,7 @@ HTML = """<!doctype html>
         alerts: {
           low_temp_enabled: document.getElementById("zoneMgmtLowTempEnabled").value === "true",
           low_temp_threshold_f: Number(document.getElementById("zoneMgmtLowTemp").value || 35),
+          call_sensing_enabled: document.getElementById("zoneMgmtCallSensingEnabled").value === "true",
           probe_swap_idle_delta_threshold_f: Number(document.getElementById("zoneMgmtProbeSwapDelta").value || 5)
         }
       };
@@ -6771,6 +7235,30 @@ HTML = """<!doctype html>
         await loadZoneMgmtStatus(zoneId);
       } catch (e) {
         setZoneMgmtMsg("Save failed: " + e.message);
+      }
+    }
+
+    async function zoneMgmtErase() {
+      const zoneId = document.getElementById("zoneMgmtSelect").value || "";
+      const zoneName = (document.getElementById("zoneMgmtName").value || zoneId || "this zone").trim();
+      if (!zoneId) { setZoneMgmtMsg("Select an adopted zone device."); return; }
+      if (!confirm(`Erase downstream zone '${zoneName}' from the hub? This removes its zone assignment and map pin/area data from the hub.`)) return;
+      setZoneMgmtMsg("Erasing zone...");
+      try {
+        const res = await fetch("/api/zone-mgmt/action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ zone_id: zoneId, action: "erase_zone" })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "erase failed");
+        setZoneMgmtMsg(data.message || "Zone erased.");
+        await refreshHub();
+        refreshZoneMgmtSelect();
+        const sel = document.getElementById("zoneMgmtSelect");
+        if (sel && sel.value) await loadZoneMgmtStatus(sel.value);
+      } catch (e) {
+        setZoneMgmtMsg("Erase failed: " + e.message);
       }
     }
 
@@ -7107,6 +7595,7 @@ HTML = """<!doctype html>
       if (menuAll) menuAll.addEventListener("click", () => { closeTasksMenu(); openAlertPanelWithFilter("all"); });
       const adminUsers = document.getElementById("adminMenuUsers");
       const adminAlerts = document.getElementById("adminMenuAlerts");
+      const adminAdopt = document.getElementById("adminMenuAdopt");
       const adminZones = document.getElementById("adminMenuZones");
       const adminMap = document.getElementById("adminMenuMap");
       const adminSetup = document.getElementById("adminMenuSetup");
@@ -7114,6 +7603,7 @@ HTML = """<!doctype html>
       const adminBackup = document.getElementById("adminMenuBackup");
       if (adminUsers) adminUsers.addEventListener("click", () => openAdminToolsFromMenu("users"));
       if (adminAlerts) adminAlerts.addEventListener("click", () => openAdminToolsFromMenu("alerts"));
+      if (adminAdopt) adminAdopt.addEventListener("click", () => openAdminToolsFromMenu("adopt"));
       if (adminZones) adminZones.addEventListener("click", () => openAdminToolsFromMenu("zones"));
       if (adminMap) adminMap.addEventListener("click", () => openAdminToolsFromMenu("map"));
       if (adminSetup) adminSetup.addEventListener("click", () => openAdminToolsFromMenu("setup"));
@@ -7172,13 +7662,55 @@ HTML = """<!doctype html>
       setAdminTab("map");
       scrollToAdminPanel("adminMapPanel");
       setTimeout(() => {
-        openZoneSetupWorkspace("zone-main");
+        const z1Pinned = !!getSiteMapPin("zone1_main");
+        const z2Pinned = !!getSiteMapPin("zone2_main");
+        const nextMode = (z1Pinned && z2Pinned) ? "zone-downstream" : "zone-main";
+        openZoneSetupWorkspace(nextMode);
+        setTimeout(() => {
+          try {
+            scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
+          } catch (_e) {}
+          if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+          if (!siteMapMap) return;
+          try { siteMapMap.invalidateSize(); } catch (_e) {}
+          if (!z1Pinned) {
+            selectMainBoilerZone("zone1_main", { preserveStep: true });
+            setSiteMapMsg("Zone Setup: start by placing the Zone 1 main boiler/circulator pin inside the building outline.");
+            return;
+          }
+          if (!z2Pinned) {
+            selectMainBoilerZone("zone2_main", { preserveStep: true });
+            setSiteMapMsg("Zone Setup: place the Zone 2 main boiler/circulator pin inside the building outline.");
+            return;
+          }
+          const unpinned = nextUnpinnedZoneId();
+          if (unpinned && !isMainZoneId(unpinned)) {
+            const sel = document.getElementById("siteMapZoneSelect");
+            if (sel) sel.value = String(unpinned);
+            syncSiteMapDetailsFormFromSelected();
+            useSelectedZoneSetupDevice();
+            return;
+          }
+          setSiteMapMsg("Zone Setup ready. Select a downstream device and click inside the building outline to place a pin.");
+        }, 160);
       }, 100);
     }
 
     function initOverviewTabs() {
       document.querySelectorAll("[data-overview-parent]").forEach((btn) => {
         btn.addEventListener("click", () => setOverviewParent(btn.dataset.overviewParent || "Zone 1"));
+      });
+    }
+
+    function initOpenGraphDelegation() {
+      document.addEventListener("click", (e) => {
+        const btn = e.target && e.target.closest ? e.target.closest("[data-open-graph-tab]") : null;
+        if (!btn) return;
+        e.preventDefault();
+        const tabId = String(btn.dataset.openGraphTab || "").trim();
+        const cycId = String(btn.dataset.openGraphCycle || "").trim();
+        if (!tabId) return;
+        focusZoneGraph(tabId, cycId);
       });
     }
 
@@ -7190,6 +7722,7 @@ HTML = """<!doctype html>
     initAlertLogFilters();
     initHeaderActions();
     initOverviewTabs();
+    initOpenGraphDelegation();
     initSiteMapAddressStepFields();
     bindZoneInfoButtons();
     const firstZoneBtn = document.getElementById("firstZoneSetupBtn");
@@ -7347,6 +7880,16 @@ HTML = """<!doctype html>
     document.getElementById("saveNotifBtn").addEventListener("click", saveNotifications);
     document.getElementById("testNotifBtn").addEventListener("click", testNotifications);
     document.getElementById("openUsersFromNotifBtn").addEventListener("click", openUsersPanel);
+    const adoptScanBtn = document.getElementById("adoptScanBtn");
+    if (adoptScanBtn) adoptScanBtn.addEventListener("click", loadAdoptDevices);
+    const adoptRefreshBtn = document.getElementById("adoptRefreshBtn");
+    if (adoptRefreshBtn) adoptRefreshBtn.addEventListener("click", loadAdoptDevices);
+    const adoptSaveBtn = document.getElementById("adoptSaveBtn");
+    if (adoptSaveBtn) adoptSaveBtn.addEventListener("click", adoptSelectedDevice);
+    const adoptLoadSetupBtn = document.getElementById("adoptLoadSetupBtn");
+    if (adoptLoadSetupBtn) adoptLoadSetupBtn.addEventListener("click", () => loadAdoptDeviceSetup());
+    const adoptClearBtn = document.getElementById("adoptClearBtn");
+    if (adoptClearBtn) adoptClearBtn.addEventListener("click", () => { clearAdoptForm(); setAdoptMsg(""); });
     document.getElementById("saveUserBtn").addEventListener("click", saveUser);
     document.getElementById("clearUserFormBtn").addEventListener("click", clearUserForm);
     document.getElementById("refreshAlertsBtn").addEventListener("click", loadAlertEvents);
@@ -7364,6 +7907,7 @@ HTML = """<!doctype html>
     });
     document.getElementById("zoneMgmtSwapBtn").addEventListener("click", zoneMgmtSwapProbes);
     document.getElementById("zoneMgmtSaveBtn").addEventListener("click", zoneMgmtSave);
+    document.getElementById("zoneMgmtEraseBtn").addEventListener("click", zoneMgmtErase);
     document.getElementById("commissionZoneSelect").addEventListener("change", (e) => {
       const zid = (e && e.target && e.target.value) ? e.target.value : "";
       loadCommissioningRecord(zid);
@@ -7487,6 +8031,52 @@ class H(BaseHTTPRequestHandler):
 
         if route == "/api/users":
             b = json.dumps(public_users_config()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/devices/discover":
+            b = json.dumps({"devices": discovered_zone_nodes(), "updated_utc": now_utc_iso()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/device/setup-state":
+            base_url = normalize_zone_node_base_url(str(query.get("base_url", [""])[0] or ""))
+            if not base_url:
+                b = json.dumps({"error": "base_url is required"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            setup_state, setup_err = fetch_remote_json(base_url + "/api/setup-state")
+            zone_payload, zone_err = fetch_remote_json(base_url + "/api/zone")
+            if not isinstance(setup_state, dict):
+                b = json.dumps({"error": f"setup-state unavailable ({setup_err or 'unknown'})"}).encode("utf-8")
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            b = json.dumps({
+                "base_url": base_url,
+                "setup_state": setup_state,
+                "zone": zone_payload if isinstance(zone_payload, dict) else None,
+                "probe_choices": setup_state.get("probe_choices", []),
+                "zone_error": zone_err,
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -7721,6 +8311,7 @@ class H(BaseHTTPRequestHandler):
             "/api/zone-mgmt/action",
             "/api/commissioning/save",
             "/api/backup/restore",
+            "/api/devices/adopt",
         ):
             self.send_response(404)
             self.end_headers()
@@ -7837,6 +8428,85 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.write(b)
                 return
             b = json.dumps({"ok": True, "users": public_users_config().get("users", [])}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+
+        if route == "/api/devices/adopt":
+            base_url = normalize_zone_node_base_url(body.get("base_url") or body.get("source_url") or "")
+            if not base_url:
+                b = json.dumps({"error": "base_url is required"}).encode("utf-8")
+                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            setup_body = body.get("setup", {}) if isinstance(body.get("setup"), dict) else {}
+            setup_apply_result = None
+            if setup_body:
+                setup_apply_result, setup_apply_err = post_remote_json(base_url + "/api/setup", setup_body)
+                if setup_apply_err:
+                    b = json.dumps({"error": f"device setup failed ({setup_apply_err})", "setup_result": setup_apply_result}).encode("utf-8")
+                    self.send_response(502); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                if not isinstance(setup_apply_result, dict) or not setup_apply_result.get("ok"):
+                    err = ""
+                    if isinstance(setup_apply_result, dict):
+                        err = str(setup_apply_result.get("error") or "")
+                        missing_fields = setup_apply_result.get("missing_fields")
+                        if isinstance(missing_fields, list) and missing_fields:
+                            err = ("missing required setup fields: " + ", ".join(str(x) for x in missing_fields))
+                    b = json.dumps({"error": err or "device setup failed", "setup_result": setup_apply_result}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            setup_state, setup_err = fetch_remote_json(base_url + "/api/setup-state")
+            zone_payload_remote, zone_err = fetch_remote_json(base_url + "/api/zone")
+            if not isinstance(setup_state, dict) and not isinstance(zone_payload_remote, dict):
+                b = json.dumps({"error": f"device unreachable ({setup_err or zone_err or 'unknown'})"}).encode("utf-8")
+                self.send_response(502); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            cfg = setup_state.get("config", {}) if isinstance(setup_state, dict) and isinstance(setup_state.get("config"), dict) else {}
+            zr = zone_payload_remote if isinstance(zone_payload_remote, dict) else {}
+            display_name = str(body.get("name") or zr.get("unit_name") or cfg.get("unit_name") or "").strip() or "Unnamed Zone Device"
+            parent_zone = str(body.get("parent_zone") or zr.get("parent_zone") or cfg.get("parent_zone") or "Zone 1").strip() or "Zone 1"
+            zone_id = str(body.get("zone_id") or zr.get("zone_id") or cfg.get("zone_id") or "").strip()
+            if not zone_id:
+                zone_id = slugify_zone_id(f"{parent_zone}-{display_name}")
+            try:
+                delta_ok_f = float(body.get("delta_ok_f", 8.0))
+            except Exception:
+                delta_ok_f = 8.0
+            source_url = base_url.rstrip("/") + "/api/zone"
+            zones = load_config()
+            for z in zones:
+                if not isinstance(z, dict):
+                    continue
+                if str(z.get("source_url") or "").strip() == source_url:
+                    b = json.dumps({"error": "device already adopted", "existing_zone_id": str(z.get("id") or "")}).encode("utf-8")
+                    self.send_response(409); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                if str(z.get("id") or "").strip() == zone_id:
+                    b = json.dumps({"error": "zone_id already exists"}).encode("utf-8")
+                    self.send_response(409); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            new_entry = {
+                "id": zone_id,
+                "name": display_name,
+                "parent_zone": parent_zone,
+                "source_url": source_url,
+                "delta_ok_f": delta_ok_f,
+            }
+            zones.append(new_entry)
+            if not save_config_zones(zones):
+                b = json.dumps({"error": "failed to save downstream zone config"}).encode("utf-8")
+                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            try:
+                refresh_downstream_cache()
+            except Exception:
+                pass
+            b = json.dumps({
+                "ok": True,
+                "message": "Device adopted and assigned to hub.",
+                "zone": new_entry,
+                "setup_result": setup_apply_result,
+                "devices": discovered_zone_nodes(),
+                "updated_utc": now_utc_iso(),
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -8076,6 +8746,54 @@ class H(BaseHTTPRequestHandler):
                     node_error = "zone has no source_url"
                 else:
                     node_result, node_error = post_remote_json(base + "/api/manage/swap-probes", {})
+            elif action == "erase_zone":
+                if zidx is not None:
+                    zones.pop(zidx)
+                    if not save_config_zones(zones):
+                        b = json.dumps({"error": "failed to save hub zone config"}).encode("utf-8")
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                        return
+                # Clean up optional hub-side metadata for the removed downstream zone.
+                try:
+                    sm = load_site_map_config()
+                    pins = sm.get("pins", {}) if isinstance(sm, dict) and isinstance(sm.get("pins"), dict) else {}
+                    if zone_id in pins:
+                        pins.pop(zone_id, None)
+                        sm["pins"] = pins
+                        save_site_map_config(sm)
+                except Exception:
+                    pass
+                try:
+                    ccfg = load_commissioning_config()
+                    recs = ccfg.get("records", {}) if isinstance(ccfg, dict) and isinstance(ccfg.get("records"), dict) else {}
+                    if zone_id in recs:
+                        recs.pop(zone_id, None)
+                        ccfg["records"] = recs
+                        ccfg["updated_utc"] = now_utc_iso()
+                        save_commissioning_config(ccfg)
+                except Exception:
+                    pass
+                try:
+                    refresh_downstream_cache()
+                except Exception:
+                    pass
+                b = json.dumps({
+                    "ok": True,
+                    "message": "Zone erased from hub. Device remains running and can be re-adopted later.",
+                    "zone_id": zone_id,
+                    "updated_utc": now_utc_iso(),
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
             elif action == "save":
                 # Update hub-side display/config first.
                 for k in ("name", "parent_zone"):

@@ -109,6 +109,20 @@ def discover_hubs():
     tried = []
     matches = []
     seen_urls = set()
+    grouped = {}
+
+    def route_rank(url: str) -> int:
+        u = str(url or '').strip().lower()
+        if u.startswith('https://') and '.ts.net' in u:
+            return 0
+        if u.startswith('http://100.'):
+            return 1
+        if '.local' in u:
+            return 2
+        if u.startswith('http://192.168.') or u.startswith('http://10.') or u.startswith('http://172.'):
+            return 3
+        return 9
+
     for c in hub_discovery_candidates():
         tried.append(c)
         hit = probe_hub(c)
@@ -118,10 +132,29 @@ def discover_hubs():
         if not hub_url or hub_url in seen_urls:
             continue
         seen_urls.add(hub_url)
-        matches.append(hit)
+        name = str(hit.get('name') or 'Heating Hub').strip() or 'Heating Hub'
+        public_url = str(hit.get('public_url') or '').strip().rstrip('/')
+        key = (name.lower(), public_url.lower())
+        grp = grouped.get(key)
+        if not grp:
+            grp = dict(hit)
+            grp['name'] = name
+            grp['public_url'] = public_url
+            grp['hub_url'] = hub_url
+            grp['routes'] = [hub_url]
+            grouped[key] = grp
+            matches.append(grp)
+        else:
+            routes = grp.get('routes') if isinstance(grp.get('routes'), list) else []
+            if hub_url not in routes:
+                routes.append(hub_url)
+            grp['routes'] = routes
+            if route_rank(hub_url) < route_rank(grp.get('hub_url') or ''):
+                grp['hub_url'] = hub_url
         if len(matches) >= 4:
             break
     if matches:
+        matches.sort(key=lambda m: route_rank(m.get('hub_url') or ''))
         return {
             'ok': True,
             'hub_url': matches[0].get('hub_url', ''),
@@ -180,6 +213,7 @@ def default_config():
             'low_temp_enabled': True,
             'low_temp_threshold_f': 35.0,
             'probe_swap_idle_delta_threshold_f': 5.0,
+            'call_sensing_enabled': True,
         }
     }
 
@@ -230,8 +264,27 @@ def reset_to_adoption_defaults(start_hotspot=True):
     return cfg, hotspot_result
 
 
+def setup_is_complete(cfg):
+    if not isinstance(cfg, dict):
+        return False
+    unit_name = str(cfg.get('unit_name') or '').strip()
+    feed_id = str(cfg.get('feed_sensor_id') or '').strip()
+    ret_id = str(cfg.get('return_sensor_id') or '').strip()
+    hub_url = str(((cfg.get('hub') or {}).get('hub_url') if isinstance(cfg.get('hub'), dict) else '') or '').strip()
+    wifi = cfg.get('wifi') or {}
+    wifi_ssid = str((wifi.get('ssid') if isinstance(wifi, dict) else '') or '').strip()
+    wifi_password = str((wifi.get('password') if isinstance(wifi, dict) else '') or '')
+    if not (unit_name and feed_id and ret_id and hub_url and wifi_ssid):
+        return False
+    if feed_id == ret_id:
+        return False
+    if not wifi_password:
+        return False
+    return True
+
+
 def recalc_configured(cfg):
-    cfg['configured'] = bool(cfg.get('unit_name')) and bool(cfg.get('feed_sensor_id')) and bool(cfg.get('return_sensor_id'))
+    cfg['configured'] = bool(setup_is_complete(cfg))
     return cfg
 
 
@@ -272,6 +325,8 @@ def update_config_fields(cfg, body):
                 alerts['probe_swap_idle_delta_threshold_f'] = float(ba.get('probe_swap_idle_delta_threshold_f'))
             except Exception:
                 pass
+        if 'call_sensing_enabled' in ba:
+            alerts['call_sensing_enabled'] = bool(ba.get('call_sensing_enabled'))
         cfg['alerts'] = alerts
     cfg['call_gpio'] = 17
     cfg['call_active_mode'] = 'dry_contact_to_gnd'
@@ -310,23 +365,26 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
     feed_f, feed_err = read_temp_f(feed_id)
     ret_f, ret_err = read_temp_f(ret_id)
 
+    alerts_cfg = cfg.get('alerts', {}) if isinstance(cfg.get('alerts'), dict) else {}
+    call_sensing_enabled = bool(alerts_cfg.get('call_sensing_enabled', True))
     heating_call = None
-    call_status = '24VAC Signal Unknown'
-    if call_reader is not None:
-        try:
-            heating_call = bool(call_reader.is_pressed)
-            call_status = '24VAC Present (Calling)' if heating_call else 'No 24VAC (Idle)'
-        except Exception:
+    call_status = '24VAC Sensing Disabled' if not call_sensing_enabled else '24VAC Signal Unknown'
+    if call_sensing_enabled:
+        if call_reader is not None:
+            try:
+                heating_call = bool(call_reader.is_pressed)
+                call_status = '24VAC Present (Calling)' if heating_call else 'No 24VAC (Idle)'
+            except Exception:
+                heating_call = None
+                call_status = '24VAC Signal Unknown'
+        elif call_reader_err:
             heating_call = None
-            call_status = '24VAC Signal Unknown'
-    elif call_reader_err:
-        call_status = '24VAC Signal Error'
+            call_status = '24VAC Signal Error'
 
     wifi_ssid = ''
     if isinstance(cfg.get('wifi'), dict):
         wifi_ssid = cfg['wifi'].get('ssid') or ''
 
-    alerts_cfg = cfg.get('alerts', {}) if isinstance(cfg.get('alerts'), dict) else {}
     low_temp_enabled = bool(alerts_cfg.get('low_temp_enabled', True))
     try:
         low_temp_threshold_f = float(alerts_cfg.get('low_temp_threshold_f', 35.0))
@@ -369,7 +427,7 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
         diagnostics_issues.append(f"Supply probe error: {feed_err}")
     if ret_err and ret_err != 'unassigned':
         diagnostics_issues.append(f"Return probe error: {ret_err}")
-    if call_reader is None and call_reader_err:
+    if call_sensing_enabled and call_reader is None and call_reader_err:
         diagnostics_issues.append(f"Call input error: {call_reader_err}")
     # Field rule: during idle (no 24VAC call), feed should normally be the hotter pipe.
     # If return is hotter by a meaningful margin, flag a likely swapped probe assignment.
@@ -391,7 +449,8 @@ def compute_payload(cfg, call_reader=None, call_reader_err=None):
         'probe_assignment_ok': bool(feed_id and ret_id and feed_id != ret_id),
         'feed_probe_ok': feed_err is None,
         'return_probe_ok': ret_err is None,
-        'call_input_ok': call_reader is not None and call_reader_err is None,
+        'call_input_ok': (not call_sensing_enabled) or (call_reader is not None and call_reader_err is None),
+        'call_sensing_enabled': call_sensing_enabled,
         'probe_swap_suspected': probe_swap_suspected,
         'probe_swap_detail': probe_swap_detail,
         'probe_swap_idle_delta_threshold_f': probe_swap_idle_delta_f,
@@ -588,6 +647,17 @@ small{color:var(--muted)} .pill{display:inline-block;border:1px solid var(--line
             </select>
           </div>
         </div>
+        <div class="row">
+          <div>
+            <label>24VAC Sensing</label>
+            <select class="form-select" name="call_sensing_enabled">
+              <option value="true">Enabled</option>
+              <option value="false">Disabled</option>
+            </select>
+            <small>Disable if this zone node should ignore 24VAC call input.</small>
+          </div>
+          <div></div>
+        </div>
 
         <h2 style="margin-top:14px">Building Wi-Fi</h2>
         <div class="row">
@@ -766,6 +836,7 @@ function fmtDateTime(iso, tz){
   }
 }
 function setMsg(t){ document.getElementById('msg').textContent = t || ''; }
+let setupWifiPasswordSaved = false;
 function hubRouteLabel(url){
   const u = (url || '').trim().toLowerCase();
   if (!u) return '';
@@ -805,11 +876,19 @@ function renderHubChoices(matches){
     title.textContent = `${m.name || 'Heating Hub'} ${arr.length > 1 ? `(${idx + 1})` : ''}`;
     title.style.fontWeight = '700';
     const sub = document.createElement('span');
-    sub.textContent = routeKind + (m.public_url && m.public_url.trim() === url ? '' : ` · ${url}`);
+    const routeCount = Array.isArray(m.routes) ? m.routes.length : 0;
+    sub.textContent = routeKind + (m.public_url && m.public_url.trim() === url ? '' : ` · ${url}`) + (routeCount > 1 ? ` · ${routeCount} routes detected` : '');
     sub.style.fontSize = '.78rem';
     sub.style.opacity = '.8';
     card.appendChild(title);
     card.appendChild(sub);
+    if (routeCount > 1) {
+      const extra = document.createElement('span');
+      extra.textContent = 'Same hub found on multiple network paths';
+      extra.style.fontSize = '.72rem';
+      extra.style.opacity = '.7';
+      card.appendChild(extra);
+    }
     card.addEventListener('click', () => {
       const f = document.getElementById('setupForm');
       f.hub_url.value = url;
@@ -899,10 +978,12 @@ async function refreshAll(){
   f.timezone.value = s.config.timezone || 'America/New_York';
   f.low_temp_threshold_f.value = (s.config.alerts && s.config.alerts.low_temp_threshold_f != null) ? s.config.alerts.low_temp_threshold_f : 35;
   f.low_temp_enabled.value = (s.config.alerts && s.config.alerts.low_temp_enabled === false) ? 'false' : 'true';
+  f.call_sensing_enabled.value = (s.config.alerts && s.config.alerts.call_sensing_enabled === false) ? 'false' : 'true';
   fillWifiSelect(document.getElementById('wifiSsidSel'), [], (s.config.wifi && s.config.wifi.ssid) || '');
   f.wifi_ssid_manual.value = (s.config.wifi && s.config.wifi.ssid) || '';
   setWifiMode((s.config.wifi && s.config.wifi.ssid) ? 'manual' : 'select');
   f.wifi_key.value = '';
+  setupWifiPasswordSaved = !!(s.config && s.config.wifi && s.config.wifi.password_saved);
   f.hub_url.value = (s.config.hub && s.config.hub.hub_url) || '';
   updateHubLinkUI(f.hub_url.value);
   renderHubChoices([]);
@@ -912,6 +993,8 @@ async function refreshAll(){
   fillSelect(document.getElementById('returnSel'), s.probe_choices || s.probes_detected, s.config.return_sensor_id || '');
   if (s.configured) {
     showSetupSuccess(true, 'This zone node is configured. You can review instructions or set up another device.');
+  } else {
+    showSetupSuccess(false);
   }
 }
 async function refreshLive(){
@@ -976,17 +1059,73 @@ async function discoverHub(autoMode){
   try {
     if (!autoMode) setMsg('Looking for hub on local network / Tailscale...');
     const res = await j('/api/hub/discover?_=' + Date.now());
-    const matches = Array.isArray(res && res.matches) ? res.matches : [];
+    const dedupeHubMatches = (arr) => {
+      const rank = (u) => {
+        const x = String(u || '').trim().toLowerCase();
+        if (x.startsWith('https://') && x.includes('.ts.net')) return 0;
+        if (x.startsWith('http://100.')) return 1;
+        if (x.includes('.local')) return 2;
+        if (x.startsWith('http://192.168.') || x.startsWith('http://10.') || x.startsWith('http://172.')) return 3;
+        return 9;
+      };
+      const groups = new Map();
+      (Array.isArray(arr) ? arr : []).forEach((m) => {
+        const url = String((m && m.hub_url) || '').trim();
+        if (!url) return;
+        const name = String((m && m.name) || 'Heating Hub').trim() || 'Heating Hub';
+        const publicUrl = String((m && m.public_url) || '').trim();
+        const key = `${name.toLowerCase()}|${publicUrl.toLowerCase() || 'nopublic'}`;
+        if (!groups.has(key)) {
+          groups.set(key, { ...m, name, public_url: publicUrl, hub_url: url, routes: [] });
+        }
+        const g = groups.get(key);
+        g.routes.push(url);
+        if (rank(url) < rank(g.hub_url)) g.hub_url = url;
+      });
+      return Array.from(groups.values()).map((g) => {
+        const seen = new Set();
+        g.routes = (Array.isArray(g.routes) ? g.routes : []).filter((u) => {
+          const k = String(u || '').trim();
+          if (!k || seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+        return g;
+      });
+    };
+    const matches = dedupeHubMatches(Array.isArray(res && res.matches) ? res.matches : []);
+    const chooseBestHub = (arr) => {
+      if (!Array.isArray(arr) || !arr.length) return '';
+      const urls = arr.map((m) => String((m && m.hub_url) || '').trim()).filter(Boolean);
+      if (!urls.length) return '';
+      const rank = (u) => {
+        const x = u.toLowerCase();
+        if (x.startsWith('https://') && x.includes('.ts.net')) return 0;   // public shared URL
+        if (x.startsWith('http://100.')) return 1;                         // tailscale private
+        if (x.includes('.local')) return 2;                                // local hostname
+        if (x.startsWith('http://192.168.') || x.startsWith('http://10.') || x.startsWith('http://172.')) return 3; // LAN IP
+        return 9;
+      };
+      urls.sort((a, b) => rank(a) - rank(b));
+      return urls[0] || '';
+    };
     if (matches.length > 1) {
+      const best = chooseBestHub(matches);
+      if (best) {
+        const f = document.getElementById('setupForm');
+        f.hub_url.value = best;
+        updateHubLinkUI(best);
+      }
       renderHubChoices(matches);
-      if (!autoMode) setMsg(`Multiple hubs found (${matches.length}). Select the correct hub.`);
+      if (!autoMode) setMsg(`Multiple hubs found (${matches.length}). ${best ? 'Best match filled automatically. ' : ''}Select the correct hub if needed.`);
+      try { document.getElementById('hubChoicesWrap')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (_e) {}
       return true;
     }
     if (res && res.ok && res.hub_url) {
       const f = document.getElementById('setupForm');
       f.hub_url.value = res.hub_url;
       updateHubLinkUI(res.hub_url);
-      renderHubChoices(matches);
+      renderHubChoices(matches.length ? matches : [res]);
       if (!autoMode) {
         setMsg(`Hub found: ${res.hub_url}`);
       }
@@ -1012,7 +1151,7 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
     feed_sensor_id: f.feed_sensor_id.value,
     return_sensor_id: f.return_sensor_id.value,
     call_gpio: 17,
-    alerts: { low_temp_threshold_f: Number(f.low_temp_threshold_f.value || 35), low_temp_enabled: (f.low_temp_enabled.value === 'true') },
+    alerts: { low_temp_threshold_f: Number(f.low_temp_threshold_f.value || 35), low_temp_enabled: (f.low_temp_enabled.value === 'true'), call_sensing_enabled: (f.call_sensing_enabled.value === 'true') },
     wifi: { ssid: (f.wifi_ssid_manual.value.trim() || f.wifi_ssid.value.trim()), password: f.wifi_key.value },
     hub: {
       hub_url: f.hub_url.value.trim(),
@@ -1020,6 +1159,18 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
       enroll_token: f.enroll_token.value.trim(),
     }
   };
+  const missing = [];
+  if (!payload.unit_name) missing.push('Device Name');
+  if (!payload.feed_sensor_id) missing.push('Supply Probe');
+  if (!payload.return_sensor_id) missing.push('Return Probe');
+  if (!payload.hub.hub_url) missing.push('Hub URL');
+  if (!payload.wifi.ssid) missing.push('Wi-Fi Name');
+  if (!payload.wifi.password && !setupWifiPasswordSaved) missing.push('Wi-Fi Password');
+  if (missing.length) {
+    showSetupSuccess(false);
+    setMsg('Complete required fields first: ' + missing.join(', '));
+    return;
+  }
   if (payload.feed_sensor_id && payload.feed_sensor_id === payload.return_sensor_id) { setMsg('Feed and Return probes must be different.'); return; }
   setMsg('Saving...');
   try {
@@ -1028,6 +1179,8 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
     if (res.configured) {
       const wifiOk = !res.wifi_apply || !!res.wifi_apply.ok;
       showSetupSuccess(true, wifiOk ? 'Setup Successful. This zone node is now configured and reporting.' : 'Configuration saved. Verify Wi-Fi connection, then continue.');
+    } else {
+      showSetupSuccess(false);
     }
     await refreshAll(); await refreshWifiStatus(); await refreshLive();
   } catch (e) { setMsg('Save failed: ' + e.message); }
@@ -1035,7 +1188,18 @@ document.getElementById('setupForm').addEventListener('submit', async (ev) => {
 document.getElementById('refreshBtn').addEventListener('click', async ()=>{ await refreshAll(); await refreshWifiStatus(); await refreshLive(); });
 document.getElementById('scanWifiBtn').addEventListener('click', async ()=>{ setMsg('Scanning Wi-Fi networks...'); await refreshWifiScan(); setMsg('Wi-Fi scan complete.'); });
 document.getElementById('setupForm').hub_url.addEventListener('input', (e)=> updateHubLinkUI(e.target.value));
-document.getElementById('findHubBtn').addEventListener('click', async ()=> { await discoverHub(false); });
+document.getElementById('findHubBtn').addEventListener('click', async (ev)=> {
+  const btn = ev.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Finding Hub...';
+  try {
+    await discoverHub(false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original || 'Find Hub';
+  }
+});
 document.getElementById('wifiSsidSel').addEventListener('change', ()=>{
   const f = document.getElementById('setupForm');
   if (f.wifi_ssid.value) f.wifi_ssid_manual.value = f.wifi_ssid.value;
@@ -1293,8 +1457,10 @@ class H(BaseHTTPRequestHandler):
         if route == '/api/setup-state':
             cfg = load_config()
             safe_cfg = json.loads(json.dumps(cfg))
-            if isinstance(safe_cfg.get('wifi'), dict) and safe_cfg['wifi'].get('password'):
-                safe_cfg['wifi']['password'] = ''
+            if isinstance(safe_cfg.get('wifi'), dict):
+                safe_cfg['wifi']['password_saved'] = bool((cfg.get('wifi') or {}).get('password'))
+                if safe_cfg['wifi'].get('password'):
+                    safe_cfg['wifi']['password'] = ''
             return self._send_json({'configured': bool(cfg.get('configured')), 'config': safe_cfg, 'probes_detected': list_probes(), 'probe_choices': probe_choices(), 'updated_utc': now_utc_iso()})
         if route == '/api/zone':
             return self._send_json(get_payload())
@@ -1445,6 +1611,8 @@ class H(BaseHTTPRequestHandler):
                 alerts['low_temp_threshold_f'] = float(body_alerts.get('low_temp_threshold_f'))
             except Exception:
                 pass
+        if 'call_sensing_enabled' in body_alerts:
+            alerts['call_sensing_enabled'] = bool(body_alerts.get('call_sensing_enabled'))
         cfg['alerts'] = alerts
 
         wifi = cfg.get('wifi', {}) if isinstance(cfg.get('wifi'), dict) else {}
@@ -1457,8 +1625,26 @@ class H(BaseHTTPRequestHandler):
 
         if cfg['feed_sensor_id'] and cfg['feed_sensor_id'] == cfg['return_sensor_id']:
             return self._send_json({'error': 'feed and return probes must differ'}, 400)
+        missing = []
+        if not str(cfg.get('unit_name') or '').strip():
+            missing.append('Device Name')
+        if not str(cfg.get('feed_sensor_id') or '').strip():
+            missing.append('Supply Probe')
+        if not str(cfg.get('return_sensor_id') or '').strip():
+            missing.append('Return Probe')
+        if not str(((cfg.get('hub') or {}).get('hub_url') if isinstance(cfg.get('hub'), dict) else '') or '').strip():
+            missing.append('Hub URL')
+        wifi_cur = cfg.get('wifi') or {}
+        if not str((wifi_cur.get('ssid') if isinstance(wifi_cur, dict) else '') or '').strip():
+            missing.append('Wi-Fi Name')
+        if not str((wifi_cur.get('password') if isinstance(wifi_cur, dict) else '') or ''):
+            missing.append('Wi-Fi Password')
+        if missing:
+            cfg['configured'] = False
+            save_config(cfg)
+            return self._send_json({'error': 'Required fields missing', 'missing_fields': missing, 'config': cfg}, 400)
 
-        cfg['configured'] = bool(cfg.get('unit_name')) and bool(cfg.get('feed_sensor_id')) and bool(cfg.get('return_sensor_id'))
+        cfg['configured'] = bool(setup_is_complete(cfg))
         save_config(cfg)
 
         wifi_apply = None
