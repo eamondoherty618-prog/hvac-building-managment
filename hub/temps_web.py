@@ -2078,6 +2078,7 @@ HTML = """<!doctype html>
     .overview-card .t{font-weight:800}
     .overview-card .s{font-size:.85rem;color:var(--muted)}
     .overview-card .line{font-size:.9rem;margin-top:4px}
+    #graphTitle.flash-target{background:#e0f2fe;border-radius:8px;padding:4px 8px;transition:background .45s ease}
     .map-preview-wrap{margin-top:14px}
     .map-preview-svg{width:100%;height:auto;min-height:260px;border:1px solid var(--border);border-radius:12px;background:#fbfdff;display:block}
     .map-preview-legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
@@ -2162,7 +2163,8 @@ HTML = """<!doctype html>
     <section class=\"chart-wrap\">
       <div class=\"chart-head\">
         <h3>Zone Performance Overview</h3>
-        <div class=\"smallnote\">Click a parent zone to see its downstream devices and quick performance stats, then jump to the graph.</div>
+          <div class=\"smallnote\">Click a parent zone to see its downstream devices and quick performance stats, then jump to the graph.</div>
+          <div id=\"zonePerfMsg\" class=\"smallnote\" style=\"margin-top:6px\"></div>
       </div>
       <div id=\"overviewParentTabs\" class=\"tabs\" style=\"margin-top:10px\">
         <button class=\"tab active\" data-overview-parent=\"Zone 1\">Zone 1</button>
@@ -2431,9 +2433,12 @@ HTML = """<!doctype html>
             <div class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\">
               <button type=\"button\" class=\"btn\" id=\"adoptScanBtn\">Scan for Zone Nodes</button>
               <button type=\"button\" class=\"btn\" id=\"adoptRefreshBtn\">Refresh List</button>
+              <button type=\"button\" class=\"btn\" id=\"adoptSelectFirstBtn\">Select First Available</button>
             </div>
+            <div id=\"adoptDetectedButtons\" class=\"full\" style=\"display:flex;gap:8px;flex-wrap:wrap\"></div>
           </div>
           <div id=\"adoptMsg\" class=\"msg\"></div>
+          <div class=\"smallnote\">Step 1: Scan for Zone Nodes. Step 2: Click Select Device on one row. Step 3: Finish adopt fields and click Adopt Device.</div>
           <div class=\"table-responsive\" style=\"margin-top:10px\">
             <table class=\"table table-hover align-middle mb-0\">
               <thead><tr><th>Device</th><th>IP</th><th>Status</th><th>Parent</th><th>Supply / Return</th><th>Call</th><th>Actions</th></tr></thead>
@@ -2481,6 +2486,7 @@ HTML = """<!doctype html>
             <div>
               <label class=\"label\" for=\"adoptWifiPassword\">Wi-Fi Password *</label>
               <input id=\"adoptWifiPassword\" class=\"input\" type=\"password\" placeholder=\"Building Wi-Fi password\">
+              <div class=\"smallnote\">Leave blank to keep the device's already-saved Wi-Fi password.</div>
             </div>
             <div>
               <label class=\"label\" for=\"adoptHubUrl\">Hub URL *</label>
@@ -2513,7 +2519,7 @@ HTML = """<!doctype html>
               <button type=\"button\" class=\"btn active\" id=\"adoptSaveBtn\">Adopt Device</button>
               <button type=\"button\" class=\"btn\" id=\"adoptClearBtn\">Clear Selection</button>
             </div>
-            <div id=\"adoptConfirm\" class=\"full smallnote hidden\" style=\"border:1px solid #86efac;background:#f0fdf4;color:#166534;padding:8px;border-radius:8px\"></div>
+            <div id=\"adoptConfirm\" class=\"full hidden\" style=\"border:2px solid #16a34a;background:#dcfce7;color:#14532d;padding:12px;border-radius:10px;font-weight:700;font-size:15px;box-shadow:0 0 0 2px rgba(22,163,74,.15) inset\"></div>
           </div>
         </div>
       </div>
@@ -3062,6 +3068,8 @@ HTML = """<!doctype html>
     let tabDefs = [];
     let historyPoints = [];
     let cycleData = null;
+    let pendingGraphTabId = "";
+    let pendingCycleZoneId = "";
     let usersCache = [];
     let alertEventsCache = [];
     let activeAlertLogFilter = "trouble";
@@ -4464,16 +4472,85 @@ HTML = """<!doctype html>
     }
 
     function focusZoneGraph(zoneGraphId, cycleZoneId) {
+      ensureAdminToolsOpen();
+      const requestedTabId = String(zoneGraphId || "").trim();
       if (zoneGraphId) currentTabId = zoneGraphId;
       if (cycleZoneId) activeCycleZoneId = cycleZoneId;
+      pendingGraphTabId = String(zoneGraphId || "");
+      pendingCycleZoneId = String(cycleZoneId || "");
+      activeRange = "live";
+      document.querySelectorAll(".btn[data-range]").forEach((b) => b.classList.remove("active"));
+      const liveBtn = document.querySelector('.btn[data-range="live"]');
+      if (liveBtn) liveBtn.classList.add("active");
       const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
       updateTabs(ds);
+      if (requestedTabId && !tabDefs.some((t) => String(t.id || "") === requestedTabId)) {
+        tabDefs.push({ id: requestedTabId, label: (cycleZoneId ? String(cycleZoneId) : requestedTabId), type: "downstream", zoneId: String(cycleZoneId || "") });
+        currentTabId = requestedTabId;
+      }
       updateCycleTabs(ds);
       renderSelectedGraph();
       refreshCycles();
       const graph = document.getElementById("graphTitle");
-      if (graph) graph.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (graph) {
+        graph.classList.add("flash-target");
+        graph.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 140);
+        window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 420);
+        window.setTimeout(() => graph.classList.remove("flash-target"), 700);
+      }
+      const perfMsg = document.getElementById("zonePerfMsg");
+      if (perfMsg) perfMsg.textContent = `Opened graph for ${cycleZoneId || zoneGraphId || "selected zone"}.`;
     }
+    function applyPendingGraphSelection(downstreamRows) {
+      const tabId = String(pendingGraphTabId || "").trim();
+      if (!tabId) return;
+      const hasTab = tabDefs.some((t) => String(t.id || "") === tabId);
+      if (!hasTab) return;
+      currentTabId = tabId;
+      const cycleId = String(pendingCycleZoneId || "").trim();
+      if (cycleId) activeCycleZoneId = cycleId;
+      updateTabs(downstreamRows || []);
+      updateCycleTabs(downstreamRows || []);
+      renderSelectedGraph();
+      refreshCycles();
+      const graph = document.getElementById("graphTitle");
+      if (graph) {
+        graph.classList.add("flash-target");
+        graph.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 140);
+        window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 420);
+        window.setTimeout(() => graph.classList.remove("flash-target"), 700);
+      }
+      pendingGraphTabId = "";
+      pendingCycleZoneId = "";
+    }
+    window.openZoneGraphFromButton = function(btnEl) {
+      const perfMsg = document.getElementById("zonePerfMsg");
+      try {
+        ensureAdminToolsOpen();
+        if (!btnEl) return false;
+        const graph = document.getElementById("graphTitle");
+        const chart = document.getElementById("historyChart");
+        if (graph && typeof graph.scrollIntoView === "function") graph.scrollIntoView({ behavior: "smooth", block: "start" });
+        if (chart && typeof chart.scrollIntoView === "function") window.setTimeout(() => chart.scrollIntoView({ behavior: "smooth", block: "start" }, 120));
+        if (graph && typeof graph.scrollIntoView === "function") {
+          window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 250);
+          window.setTimeout(() => graph.scrollIntoView({ behavior: "smooth", block: "start" }), 650);
+        }
+        try { window.location.hash = "graphTitle"; } catch (_e) {}
+        const tabId = String((btnEl.dataset && btnEl.dataset.openGraphTab) || "").trim();
+        const cycId = String((btnEl.dataset && btnEl.dataset.openGraphCycle) || "").trim();
+        if (!tabId) return false;
+        focusZoneGraph(tabId, cycId);
+        refreshHub();
+        if (perfMsg) perfMsg.textContent = `Opening graph for ${cycId || tabId}...`;
+        return false;
+      } catch (e) {
+        if (perfMsg) perfMsg.textContent = `Open Graph error: ${e && e.message ? e.message : "unknown"}`;
+        return false;
+      }
+    };
 
     function renderZoneOverview() {
       const kpiEl = document.getElementById("overviewKpis");
@@ -4539,7 +4616,7 @@ HTML = """<!doctype html>
               <div class="t">${z.name || z.id || "--"}</div>
               <div class="s">${z.id || ""}</div>
             </div>
-            <button type="button" class="btn" data-open-graph-tab="ds_${zoneId}" data-open-graph-cycle="${zoneId}" onclick="focusZoneGraph('ds_${zoneIdJs}','${zoneIdJs}'); return false;" style="padding:4px 10px">Open Graph</button>
+            <button type="button" class="btn" data-open-graph-tab="ds_${zoneId}" data-open-graph-cycle="${zoneId}" onclick="return window.openZoneGraphFromButton(this)" style="padding:4px 10px">Open Graph</button>
           </div>
           <div class="line">Call: ${z.call_status || (z.heating_call === true ? "24VAC Present (Calling)" : (z.heating_call === false ? "No 24VAC (Idle)" : "24VAC Signal Unknown"))}</div>
           <div class="line">Supply: ${fmtTemp(z.feed_f)} · Return: ${fmtTemp(z.return_f)}</div>
@@ -4548,7 +4625,9 @@ HTML = """<!doctype html>
         `;
         const btn = card.querySelector("button[data-open-graph-tab]");
         if (btn) {
-          btn.addEventListener("click", () => {
+          btn.addEventListener("click", (ev) => {
+            if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+            if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
             focusZoneGraph(btn.dataset.openGraphTab || ("ds_" + (z.id || "")), btn.dataset.openGraphCycle || (z.id || ""));
           });
         }
@@ -5167,6 +5246,7 @@ HTML = """<!doctype html>
         appendLivePoint(r, downstream, (data.main && Object.prototype.hasOwnProperty.call(data.main, "main_call_24vac")) ? data.main.main_call_24vac : null);
         updateTabs(downstream);
         updateCycleTabs(downstream);
+        applyPendingGraphSelection(downstream);
         renderRows(downstream);
         renderZoneOverview();
         renderMainMapPreview();
@@ -6901,12 +6981,14 @@ HTML = """<!doctype html>
     }
 
     let adoptDevicesCache = [];
+    let adoptSelectedBaseUrl = "";
 
     function slugifyClient(text) {
       return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `zone-${Math.random().toString(16).slice(2, 8)}`;
     }
 
     function clearAdoptForm() {
+      adoptSelectedBaseUrl = "";
       const ids = ["adoptBaseUrl","adoptName","adoptZoneId","adoptWifiSsid","adoptWifiPassword","adoptHubUrl"];
       ids.forEach((id) => { const el = document.getElementById(id); if (el) el.value = ""; });
       const p = document.getElementById("adoptParentZone"); if (p) p.value = "Zone 1";
@@ -6918,7 +7000,10 @@ HTML = """<!doctype html>
       const rp = document.getElementById("adoptReturnProbe"); if (rp) rp.innerHTML = '<option value="">Load device setup first</option>';
       const ok = document.getElementById("adoptConfirm"); if (ok) { ok.classList.add("hidden"); ok.textContent = ""; }
       const saveBtn = document.getElementById("adoptSaveBtn");
-      if (saveBtn) delete saveBtn.dataset.selectedBase;
+      if (saveBtn) {
+        delete saveBtn.dataset.selectedBase;
+        delete saveBtn.dataset.passwordSaved;
+      }
     }
 
     function fillProbeSelect(selectId, choices, selectedValue) {
@@ -6967,6 +7052,8 @@ HTML = """<!doctype html>
         document.getElementById("adoptCallSensingEnabled").value = (alerts.call_sensing_enabled === false) ? "false" : "true";
         const pw = document.getElementById("adoptWifiPassword");
         if (pw) pw.value = "";
+        const saveBtn = document.getElementById("adoptSaveBtn");
+        if (saveBtn) saveBtn.dataset.passwordSaved = (wifi.password_saved === true) ? "true" : "false";
         setAdoptMsg("Device setup loaded. Fill required fields and click Adopt Device.");
       } catch (e) {
         setAdoptMsg("Setup load failed: " + e.message);
@@ -6976,6 +7063,7 @@ HTML = """<!doctype html>
     function fillAdoptFormFromDevice(dev) {
       if (!dev) return;
       const base = dev.base_url || "";
+      adoptSelectedBaseUrl = base;
       const name = dev.unit_name || dev.adopted_name || "";
       document.getElementById("adoptBaseUrl").value = base;
       document.getElementById("adoptName").value = name;
@@ -6984,12 +7072,41 @@ HTML = """<!doctype html>
       document.getElementById("adoptZoneId").value = suggested;
       document.getElementById("adoptDeltaOk").value = "8";
       document.getElementById("adoptSaveBtn").dataset.selectedBase = base;
-      setAdoptMsg(`Selected ${name || dev.ip || "device"} for adoption.`);
+      setAdoptMsg(`Device selected: ${name || dev.ip || "device"}. Device URL is locked. Continue below to finish adoption.`);
       loadAdoptDeviceSetup(base);
     }
 
     function renderAdoptDevices(devices) {
       adoptDevicesCache = Array.isArray(devices) ? devices : [];
+      const quick = document.getElementById("adoptDetectedButtons");
+      if (quick) {
+        quick.innerHTML = "";
+        if (adoptDevicesCache.length) {
+          adoptDevicesCache.forEach((d) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn";
+            btn.style.padding = "4px 10px";
+            const label = (d.unit_name || d.ip || "Device");
+            btn.textContent = d.adopted ? `${label} (Adopted)` : label;
+            if (d.adopted) {
+              btn.disabled = true;
+              btn.style.opacity = "0.6";
+            } else {
+              btn.addEventListener("click", () => {
+                fillAdoptFormFromDevice(d);
+                const panel = document.getElementById("adoptBaseUrl");
+                if (panel && typeof panel.scrollIntoView === "function") panel.scrollIntoView({ behavior: "smooth", block: "center" });
+                renderAdoptDevices(adoptDevicesCache);
+              });
+            }
+            if ((d.base_url || "") === adoptSelectedBaseUrl) {
+              btn.classList.add("active");
+            }
+            quick.appendChild(btn);
+          });
+        }
+      }
       const body = document.getElementById("adoptDevicesBody");
       if (!body) return;
       body.innerHTML = "";
@@ -6999,6 +7116,18 @@ HTML = """<!doctype html>
       }
       adoptDevicesCache.forEach((d) => {
         const tr = document.createElement("tr");
+        if ((d.base_url || "") === adoptSelectedBaseUrl) tr.style.background = "#eef6ff";
+        if (!d.adopted) {
+          tr.style.cursor = "pointer";
+          tr.title = "Click row to select this device";
+          tr.addEventListener("click", () => {
+            fillAdoptFormFromDevice(d);
+            if (!d.configured) setAdoptMsg("Device selected. Complete required setup fields below, then click Adopt Device.");
+            const panel = document.getElementById("adoptBaseUrl");
+            if (panel && typeof panel.scrollIntoView === "function") panel.scrollIntoView({ behavior: "smooth", block: "center" });
+            renderAdoptDevices(adoptDevicesCache);
+          });
+        }
         const statusBits = [];
         statusBits.push(d.configured ? "Configured" : "Setup Required");
         if (d.adopted) statusBits.push(`Adopted (${d.adopted_zone_id || "--"})`);
@@ -7020,10 +7149,14 @@ HTML = """<!doctype html>
           btn.type = "button";
           btn.className = "btn";
           btn.style.padding = "4px 10px";
-          btn.textContent = d.configured ? "Adopt" : "Prepare";
-          btn.addEventListener("click", () => {
+          btn.textContent = d.configured ? "Select Device" : "Select + Prepare";
+          btn.addEventListener("click", (ev) => {
+            if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
             fillAdoptFormFromDevice(d);
-            if (!d.configured) setAdoptMsg("Device is not fully configured yet. Finish zone-node setup first, then adopt it here.");
+            if (!d.configured) setAdoptMsg("Device selected. Complete required setup fields below, then click Adopt Device.");
+            const panel = document.getElementById("adoptBaseUrl");
+            if (panel && typeof panel.scrollIntoView === "function") panel.scrollIntoView({ behavior: "smooth", block: "center" });
+            renderAdoptDevices(adoptDevicesCache);
           });
           td.appendChild(btn);
         } else {
@@ -7040,13 +7173,26 @@ HTML = """<!doctype html>
         if (!res.ok || data.error) throw new Error(data.error || "discover failed");
         renderAdoptDevices(data.devices || []);
         const unadopted = (data.devices || []).filter((d) => !d.adopted).length;
-        setAdoptMsg(`Scan complete. ${unadopted} device(s) available to adopt.`);
+        setAdoptMsg(`Scan complete. ${unadopted} device(s) available. Click Select Device on the row you want to adopt.`);
       } catch (e) {
         setAdoptMsg("Scan failed: " + e.message);
       }
     }
 
+    function selectFirstAdoptableDevice() {
+      const first = (adoptDevicesCache || []).find((d) => d && !d.adopted);
+      if (!first) {
+        setAdoptMsg("No unadopted devices available. Run Scan first.");
+        return;
+      }
+      fillAdoptFormFromDevice(first);
+      const panel = document.getElementById("adoptBaseUrl");
+      if (panel && typeof panel.scrollIntoView === "function") panel.scrollIntoView({ behavior: "smooth", block: "center" });
+      renderAdoptDevices(adoptDevicesCache);
+    }
+
     async function adoptSelectedDevice() {
+      const applySetup = false; // Safe adopt: do not push /api/setup to node during adoption.
       const base = (document.getElementById("adoptBaseUrl").value || "").trim();
       const name = (document.getElementById("adoptName").value || "").trim();
       const zoneId = (document.getElementById("adoptZoneId").value || "").trim();
@@ -7060,20 +7206,24 @@ HTML = """<!doctype html>
       const lowTempEnabled = document.getElementById("adoptLowTempEnabled").value === "true";
       const lowTempThresholdF = Number(document.getElementById("adoptLowTempThreshold").value || 35);
       const callSensingEnabled = document.getElementById("adoptCallSensingEnabled").value === "true";
+      const saveBtn = document.getElementById("adoptSaveBtn");
+      const passwordSaved = !!(saveBtn && saveBtn.dataset && saveBtn.dataset.passwordSaved === "true");
       const missing = [];
       if (!base) missing.push("Device URL");
       if (!name) missing.push("Display Name");
       if (!zoneId) missing.push("Zone ID");
       if (!parentZone) missing.push("Parent Zone");
-      if (!supplyProbe) missing.push("Supply Probe");
-      if (!returnProbe) missing.push("Return Probe");
-      if (!wifiSsid) missing.push("Wi-Fi Name");
-      if (!wifiPassword) missing.push("Wi-Fi Password");
-      if (!hubUrl) missing.push("Hub URL");
+      if (applySetup) {
+        if (!supplyProbe) missing.push("Supply Probe");
+        if (!returnProbe) missing.push("Return Probe");
+        if (!wifiSsid) missing.push("Wi-Fi Name");
+        if (!wifiPassword && !passwordSaved) missing.push("Wi-Fi Password");
+        if (!hubUrl) missing.push("Hub URL");
+      }
       if (missing.length) { setAdoptMsg(`Required fields missing: ${missing.join(", ")}`); return; }
-      if (supplyProbe === returnProbe) { setAdoptMsg("Supply Probe and Return Probe must be different."); return; }
+      if (applySetup && supplyProbe === returnProbe) { setAdoptMsg("Supply Probe and Return Probe must be different."); return; }
       if (!Number.isFinite(deltaOk) || deltaOk < 0) { setAdoptMsg("Supply/Return Match Threshold must be a valid number."); return; }
-      if (!Number.isFinite(lowTempThresholdF) || lowTempThresholdF < 0) { setAdoptMsg("Low Temp Threshold must be a valid number."); return; }
+      if (applySetup && (!Number.isFinite(lowTempThresholdF) || lowTempThresholdF < 0)) { setAdoptMsg("Low Temp Threshold must be a valid number."); return; }
       setAdoptMsg("Adopting device...");
       try {
         const res = await fetch("/api/devices/adopt", {
@@ -7085,30 +7235,38 @@ HTML = """<!doctype html>
             zone_id: zoneId,
             parent_zone: parentZone,
             delta_ok_f: deltaOk,
-            setup: {
+            apply_setup: applySetup,
+            setup: applySetup ? {
+              apply_wifi: false,
               unit_name: name,
               zone_id: zoneId,
               parent_zone: parentZone,
               feed_sensor_id: supplyProbe,
               return_sensor_id: returnProbe,
-              wifi: { ssid: wifiSsid, password: wifiPassword },
+              wifi: (wifiPassword ? { ssid: wifiSsid, password: wifiPassword } : { ssid: wifiSsid }),
               hub: { hub_url: hubUrl },
               alerts: {
                 low_temp_enabled: lowTempEnabled,
                 low_temp_threshold_f: lowTempThresholdF,
                 call_sensing_enabled: callSensingEnabled,
               },
-            },
+            } : {},
           })
         });
         const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || "adopt failed");
+        if (!res.ok || data.error) {
+          const missingFields = (data && Array.isArray(data.missing_fields) && data.missing_fields.length)
+            ? ` (Missing: ${data.missing_fields.join(", ")})`
+            : "";
+          throw new Error((data && data.error ? data.error : "adopt failed") + missingFields);
+        }
         setAdoptMsg(data.message || "Device adopted.");
         clearAdoptForm();
         const ok = document.getElementById("adoptConfirm");
         if (ok) {
-          ok.textContent = `Adopted: ${name} | Zone ID: ${zoneId} | Parent: ${parentZone} | Device: ${base}`;
+          ok.innerHTML = `✅ Device Adopted Successfully<br><span style="font-weight:600">Name:</span> ${name} &nbsp;|&nbsp; <span style="font-weight:600">Zone ID:</span> ${zoneId} &nbsp;|&nbsp; <span style="font-weight:600">Parent:</span> ${parentZone}<br><span style="font-weight:600">Device URL:</span> ${base}`;
           ok.classList.remove("hidden");
+          if (typeof ok.scrollIntoView === "function") ok.scrollIntoView({ behavior: "smooth", block: "center" });
         }
         renderAdoptDevices(data.devices || []);
         await refreshHub();
@@ -7884,6 +8042,8 @@ HTML = """<!doctype html>
     if (adoptScanBtn) adoptScanBtn.addEventListener("click", loadAdoptDevices);
     const adoptRefreshBtn = document.getElementById("adoptRefreshBtn");
     if (adoptRefreshBtn) adoptRefreshBtn.addEventListener("click", loadAdoptDevices);
+    const adoptSelectFirstBtn = document.getElementById("adoptSelectFirstBtn");
+    if (adoptSelectFirstBtn) adoptSelectFirstBtn.addEventListener("click", selectFirstAdoptableDevice);
     const adoptSaveBtn = document.getElementById("adoptSaveBtn");
     if (adoptSaveBtn) adoptSaveBtn.addEventListener("click", adoptSelectedDevice);
     const adoptLoadSetupBtn = document.getElementById("adoptLoadSetupBtn");
@@ -8443,8 +8603,38 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
             setup_body = body.get("setup", {}) if isinstance(body.get("setup"), dict) else {}
             setup_apply_result = None
-            if setup_body:
-                setup_apply_result, setup_apply_err = post_remote_json(base_url + "/api/setup", setup_body)
+            setup_warning = None
+            apply_setup = bool(body.get("apply_setup", False))
+            if setup_body and apply_setup:
+                setup_apply_result, setup_apply_err = post_remote_json(base_url + "/api/setup", setup_body, timeout=35)
+                # Setup on zone nodes can briefly time out while network settings apply.
+                # If that happens, try reading setup-state and continue if fields are present.
+                if setup_apply_err and "timed out" in str(setup_apply_err).lower():
+                    setup_warning = "Device setup request timed out; continuing adoption and using current device state."
+                    recover_state, recover_err = fetch_remote_json(base_url + "/api/setup-state")
+                    if isinstance(recover_state, dict):
+                        recover_cfg = recover_state.get("config", {}) if isinstance(recover_state.get("config"), dict) else {}
+                        req_ok = True
+                        for rk in ("unit_name", "feed_sensor_id", "return_sensor_id"):
+                            if not str(recover_cfg.get(rk) or "").strip():
+                                req_ok = False
+                                break
+                        hub_cfg = recover_cfg.get("hub", {}) if isinstance(recover_cfg.get("hub"), dict) else {}
+                        wifi_cfg = recover_cfg.get("wifi", {}) if isinstance(recover_cfg.get("wifi"), dict) else {}
+                        if not str(hub_cfg.get("hub_url") or "").strip():
+                            req_ok = False
+                        if not str(wifi_cfg.get("ssid") or "").strip():
+                            req_ok = False
+                        if req_ok:
+                            setup_apply_result = {"ok": True, "message": "setup request timed out but device setup appears applied"}
+                            setup_apply_err = None
+                    else:
+                        setup_apply_result = setup_apply_result or {"ok": False, "recover_error": recover_err}
+                    # Do not hard-fail adoption on timeout path. Device may have applied config
+                    # but dropped/rejoined network before returning HTTP response.
+                    setup_apply_err = None
+                    if not isinstance(setup_apply_result, dict):
+                        setup_apply_result = {"ok": True, "message": "setup response timed out; adoption continued"}
                 if setup_apply_err:
                     b = json.dumps({"error": f"device setup failed ({setup_apply_err})", "setup_result": setup_apply_result}).encode("utf-8")
                     self.send_response(502); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
@@ -8457,6 +8647,8 @@ class H(BaseHTTPRequestHandler):
                             err = ("missing required setup fields: " + ", ".join(str(x) for x in missing_fields))
                     b = json.dumps({"error": err or "device setup failed", "setup_result": setup_apply_result}).encode("utf-8")
                     self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+            elif setup_body and not apply_setup:
+                setup_warning = "Node setup push skipped during adopt (safe mode)."
             setup_state, setup_err = fetch_remote_json(base_url + "/api/setup-state")
             zone_payload_remote, zone_err = fetch_remote_json(base_url + "/api/zone")
             if not isinstance(setup_state, dict) and not isinstance(zone_payload_remote, dict):
@@ -8501,9 +8693,10 @@ class H(BaseHTTPRequestHandler):
                 pass
             b = json.dumps({
                 "ok": True,
-                "message": "Device adopted and assigned to hub.",
+                "message": "Device adopted and assigned to hub." if not setup_warning else ("Device adopted. " + setup_warning),
                 "zone": new_entry,
                 "setup_result": setup_apply_result,
+                "setup_warning": setup_warning,
                 "devices": discovered_zone_nodes(),
                 "updated_utc": now_utc_iso(),
             }).encode("utf-8")

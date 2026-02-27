@@ -1648,9 +1648,12 @@ class H(BaseHTTPRequestHandler):
         save_config(cfg)
 
         wifi_apply = None
+        apply_wifi_now = True
+        if isinstance(body, dict) and 'apply_wifi' in body:
+            apply_wifi_now = bool(body.get('apply_wifi'))
         ssid = (cfg.get('wifi') or {}).get('ssid', '').strip()
         psk = (cfg.get('wifi') or {}).get('password', '')
-        if ssid and psk:
+        if apply_wifi_now and ssid and psk:
             # Try applying Wi-Fi after config save. This may interrupt current connection if run over Wi-Fi.
             wifi_apply = run_net_helper('connect', ssid, psk, timeout=35)
             if wifi_apply.get('ok'):
