@@ -53,6 +53,7 @@ LEGACY_SITE_MAP_CONFIG_PATH = SITE_MAP_CONFIG_PATH
 LEGACY_COMMISSIONING_CONFIG_PATH = COMMISSIONING_CONFIG_PATH
 DEFAULT_ALERT_COOLDOWN_MIN = 120
 ZONE1_CALL_ALERT_GRACE_SECONDS = 120
+OUTDOOR_CACHE_SECONDS = 900
 PUBLIC_HUB_URL = "https://165-boiler.tail58e171.ts.net/"
 HUB_SITE_NAME = "165 Water Street Heating Hub"
 DEFAULT_ALERT_PREFS = {
@@ -75,6 +76,7 @@ stop_event = threading.Event()
 last_alert_sent_at = None
 last_alert_key = None
 downstream_cache_lock = threading.Lock()
+buildings_config_lock = threading.Lock()
 downstream_cache = []
 downstream_cache_updated_utc = None
 local_cache_lock = threading.Lock()
@@ -88,6 +90,8 @@ cycle_trackers = {}
 perf_alert_last_sent = {}
 downstream_offline_state = {}
 downstream_hardware_state = {}
+outdoor_cache_lock = threading.Lock()
+outdoor_temp_cache = {}
 
 main_call_input = None
 if Button is not None:
@@ -278,14 +282,13 @@ def load_buildings_config():
         active = str(data.get("active_building_id") or "local").strip().lower() or "local"
         if not any(b.get("id") == active for b in out):
             active = "local"
-        cfg = {"active_building_id": active, "buildings": out, "updated_utc": now_utc_iso()}
+        cfg = {"active_building_id": active, "buildings": out, "updated_utc": str(data.get("updated_utc") or now_utc_iso())}
         for b in out:
             if isinstance(b, dict):
                 try:
                     init_building_state(str(b.get("id") or ""), reset=False)
                 except Exception:
                     pass
-        save_buildings_config(cfg)
         return cfg
     except Exception:
         cfg = default_buildings_config()
@@ -427,6 +430,7 @@ def default_site_map_config():
         "map_layer": "street",
         "building_confirm_pin": None,
         "building_outline": None,
+        "planned_zones": [],
         "pins": {},
         "updated_utc": now_utc_iso(),
     }
@@ -604,6 +608,27 @@ def load_site_map_config():
         bo = data.get("building_outline")
         if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
             cfg["building_outline"] = bo
+        planned_in = data.get("planned_zones")
+        if isinstance(planned_in, list):
+            planned_out = []
+            for item in planned_in:
+                if len(planned_out) >= 200:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                zid = str(item.get("id") or "").strip()
+                if not zid:
+                    continue
+                parent_zone = str(item.get("parent_zone") or "Zone 1").strip()
+                if parent_zone not in ("Zone 1", "Zone 2"):
+                    parent_zone = "Zone 1"
+                planned_out.append({
+                    "id": zid,
+                    "label": str(item.get("label") or zid).strip()[:120] or zid,
+                    "parent_zone": parent_zone,
+                    "updated_utc": str(item.get("updated_utc") or now_utc_iso()),
+                })
+            cfg["planned_zones"] = planned_out
         pins_in = data.get("pins", {}) if isinstance(data.get("pins"), dict) else {}
         pins_out = {}
         for zid, p in pins_in.items():
@@ -690,6 +715,27 @@ def save_site_map_config(cfg):
             bo = cfg.get("building_outline")
             if isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
                 cfg_out["building_outline"] = bo
+            planned_in = cfg.get("planned_zones")
+            if isinstance(planned_in, list):
+                planned_out = []
+                for item in planned_in:
+                    if len(planned_out) >= 200:
+                        break
+                    if not isinstance(item, dict):
+                        continue
+                    zid = str(item.get("id") or "").strip()
+                    if not zid:
+                        continue
+                    parent_zone = str(item.get("parent_zone") or "Zone 1").strip()
+                    if parent_zone not in ("Zone 1", "Zone 2"):
+                        parent_zone = "Zone 1"
+                    planned_out.append({
+                        "id": zid,
+                        "label": str(item.get("label") or zid).strip()[:120] or zid,
+                        "parent_zone": parent_zone,
+                        "updated_utc": str(item.get("updated_utc") or now_utc_iso()),
+                    })
+                cfg_out["planned_zones"] = planned_out
             pins = cfg.get("pins", {})
             if isinstance(pins, dict):
                 cfg_out["pins"] = {}
@@ -1924,6 +1970,7 @@ def cycle_analytics_for_window(window_key, zone_id="zone1_main"):
         })
 
     total_cycles = 0
+    completed_runtime_s = 0.0
     total_runtime_s = 0.0
     short_cycle_count = 0
     response_samples = []
@@ -1939,14 +1986,28 @@ def cycle_analytics_for_window(window_key, zone_id="zone1_main"):
                     obj = json.loads(line)
                     if str(obj.get("zone", "zone1_main")) != str(zone_id):
                         continue
+                    start_ts = iso_to_dt(obj.get("start_ts", ""))
                     end_ts = iso_to_dt(obj.get("end_ts", ""))
                     duration_s = float(obj.get("duration_s", 0) or 0)
                 except Exception:
                     continue
-                if end_ts is None or end_ts < cutoff:
+                if end_ts is None:
+                    continue
+                if start_ts is None:
+                    try:
+                        start_ts = end_ts - timedelta(seconds=max(0.0, duration_s))
+                    except Exception:
+                        start_ts = end_ts
+                if end_ts < cutoff or start_ts > now:
+                    continue
+                overlap_start = max(start_ts, cutoff)
+                overlap_end = min(end_ts, now)
+                overlap_s = max(0.0, (overlap_end - overlap_start).total_seconds())
+                if overlap_s <= 0.0:
                     continue
                 total_cycles += 1
-                total_runtime_s += max(0.0, duration_s)
+                completed_runtime_s += overlap_s
+                total_runtime_s += overlap_s
                 if bool(obj.get("short_cycle")):
                     short_cycle_count += 1
                 if obj.get("response_lag_s") is not None:
@@ -1959,7 +2020,15 @@ def cycle_analytics_for_window(window_key, zone_id="zone1_main"):
                 idx = int((end_ts - bucket_start0).total_seconds() // bucket_step.total_seconds())
                 if 0 <= idx < len(buckets):
                     buckets[idx]["cycles"] += 1
-                    buckets[idx]["runtime_minutes"] += max(0.0, duration_s) / 60.0
+                # Distribute runtime across all overlapping buckets so chart and totals reflect the selected window.
+                for bi, b in enumerate(buckets):
+                    bs = bucket_start0 + bucket_step * bi
+                    be = bs + bucket_step
+                    seg_start = max(overlap_start, bs)
+                    seg_end = min(overlap_end, be)
+                    seg_s = max(0.0, (seg_end - seg_start).total_seconds())
+                    if seg_s > 0.0:
+                        b["runtime_minutes"] += seg_s / 60.0
 
     open_cycle = None
     with cycle_state_lock:
@@ -1988,7 +2057,7 @@ def cycle_analytics_for_window(window_key, zone_id="zone1_main"):
         b["runtime_minutes"] = round(b["runtime_minutes"], 2)
 
     window_seconds = max(1.0, window.total_seconds())
-    avg_cycle_minutes = (total_runtime_s / 60.0 / total_cycles) if total_cycles else 0.0
+    avg_cycle_minutes = (completed_runtime_s / 60.0 / total_cycles) if total_cycles else 0.0
     duty_cycle_pct = (total_runtime_s / window_seconds) * 100.0
     avg_response_lag_min = (sum(response_samples) / len(response_samples) / 60.0) if response_samples else 0.0
     short_cycle_pct = (short_cycle_count / total_cycles * 100.0) if total_cycles else 0.0
@@ -2073,6 +2142,68 @@ def sample_loop():
         stop_event.wait(SAMPLE_INTERVAL_SECONDS)
 
 
+def outdoor_temp_payload():
+    bid = normalize_building_id(active_building_id())
+    now = now_utc()
+    with outdoor_cache_lock:
+        cached = outdoor_temp_cache.get(bid)
+        if isinstance(cached, dict):
+            fetched = cached.get("fetched_at")
+            if isinstance(fetched, datetime) and (now - fetched).total_seconds() < OUTDOOR_CACHE_SECONDS:
+                return dict(cached.get("payload") or {})
+
+    cfg = load_site_map_config()
+    center = cfg.get("center", {}) if isinstance(cfg, dict) else {}
+    lat = as_float(center.get("lat"))
+    lng = as_float(center.get("lng"))
+    if lat is None or lng is None:
+        return {
+            "status": "no-location",
+            "temp_f": None,
+            "source": "open-meteo",
+            "updated_utc": now_utc_iso(),
+        }
+
+    url = "https://api.open-meteo.com/v1/forecast?" + urlencode({
+        "latitude": round(float(lat), 6),
+        "longitude": round(float(lng), 6),
+        "current": "temperature_2m",
+        "temperature_unit": "fahrenheit",
+    })
+    payload = {
+        "status": "error",
+        "temp_f": None,
+        "source": "open-meteo",
+        "lat": round(float(lat), 6),
+        "lng": round(float(lng), 6),
+        "updated_utc": now_utc_iso(),
+    }
+    try:
+        req = Request(url, headers={"User-Agent": "hvac-heating-hub/1.0"})
+        with urlopen(req, timeout=6) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+        cur = data.get("current", {}) if isinstance(data, dict) else {}
+        tf = as_float(cur.get("temperature_2m"))
+        if tf is not None:
+            payload["status"] = "ok"
+            payload["temp_f"] = round(float(tf), 1)
+    except Exception as e:
+        payload["error"] = str(e)
+        with outdoor_cache_lock:
+            old = outdoor_temp_cache.get(bid)
+            if isinstance(old, dict) and isinstance(old.get("payload"), dict):
+                stale = dict(old["payload"])
+                stale["status"] = "stale"
+                stale["updated_utc"] = now_utc_iso()
+                return stale
+        return payload
+
+    with outdoor_cache_lock:
+        outdoor_temp_cache[bid] = {"fetched_at": now, "payload": dict(payload)}
+    return payload
+
+
 def hub_payload():
     local = local_payload()
     downstream = get_downstream_cached()
@@ -2080,6 +2211,7 @@ def hub_payload():
     return {
         "main": local,
         "downstream": downstream,
+        "outdoor": outdoor_temp_payload(),
         "trouble_count": trouble_count,
         "unack_alert_count": unacknowledged_alert_count(),
         "downstream_cache_updated_utc": downstream_cache_updated_utc,
@@ -2123,6 +2255,22 @@ HTML = """<!doctype html>
     }
     h1 { margin:0; font-size:clamp(1.55rem,2.8vw,2.2rem); }
     .meta { opacity:.9; font-size:.92rem; margin-top:4px; }
+    .outside-temp-badge{
+      display:inline-block;
+      margin-top:2px;
+      padding:3px 7px;
+      border-radius:999px;
+      background:#e6f6ff;
+      border:1px solid #9fd3ea;
+      color:#0b4f6c;
+      font-weight:700;
+      font-size:.78rem;
+      letter-spacing:.01em;
+      max-width:190px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
     .pill { border:1px solid rgba(255,255,255,.26); border-radius:999px; padding:7px 12px; font-weight:700; background:rgba(255,255,255,.1); backdrop-filter: blur(4px); }
     .head-pill-btn{border:1px solid rgba(255,255,255,.26);border-radius:999px;padding:7px 12px;font-weight:700;background:rgba(255,255,255,.1);color:#f2fbff;cursor:pointer}
     .head-pill-btn:hover{background:rgba(255,255,255,.16)}
@@ -2210,6 +2358,18 @@ HTML = """<!doctype html>
     .form-grid .full{grid-column:1 / -1}
     .input,.select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fff}
     .input:focus,.select:focus{outline:none;border-color:#8bc2d3;box-shadow:0 0 0 4px rgba(22,138,173,.12)}
+    .addr-suggest{
+      position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:2600;
+      display:none; max-height:220px; overflow:auto; background:#fff;
+      border:1px solid var(--border); border-radius:10px; box-shadow:0 10px 24px rgba(10,31,44,.14);
+    }
+    .addr-suggest.show{display:block}
+    .addr-suggest .item{
+      display:block; width:100%; border:0; border-bottom:1px solid #edf2f7; background:#fff;
+      text-align:left; padding:10px 12px; cursor:pointer; color:#102030; font-size:.9rem;
+    }
+    .addr-suggest .item:last-child{border-bottom:0}
+    .addr-suggest .item:hover,.addr-suggest .item.active{background:#edf7fc}
     .smallnote{font-size:.82rem;color:var(--muted)}
     .msg{margin-top:8px;font-weight:700;color:#114b5f;white-space:pre-wrap}
     .hidden{display:none !important}
@@ -2230,6 +2390,9 @@ HTML = """<!doctype html>
     #siteMapCanvas{width:100%;height:420px;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#eef6fb}
     .site-map-tools{display:grid;grid-template-columns:2fr 1fr auto auto;gap:10px;align-items:end}
     .site-map-tools > .full{grid-column:1 / -1}
+    .site-address-header{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+    .site-address-editor.collapsed{display:none}
+    .site-map-plan-tools{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) auto;gap:8px;align-items:end}
     .site-map-card.building-setup-mode .site-map-tools{grid-template-columns:minmax(0,1fr) auto}
     .site-map-subtools{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end;margin-top:10px}
     .site-map-workspace-bar{display:none;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:#fff}
@@ -2237,8 +2400,8 @@ HTML = """<!doctype html>
     .site-map-workspace-bar .left{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .site-map-workspace-bar .right{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .site-map-card.workspace{
-      position:fixed; inset:12px; z-index:1900; margin:0 !important; overflow:auto;
-      background:#f9fcfe; box-shadow:0 24px 64px rgba(10,31,44,.28);
+      position:relative; inset:auto; z-index:auto; margin-top:0 !important; overflow:visible;
+      background:#f9fcfe; box-shadow:none;
     }
     .site-map-card.workspace #siteMapCanvas{height:min(62vh,620px)}
     .site-map-card.building-setup-mode #siteMapZoneSelectWrap{display:none}
@@ -2257,7 +2420,7 @@ HTML = """<!doctype html>
     .site-map-zone-wizard .mode-tabs .btn{padding:4px 10px;font-size:.85rem}
     .site-map-zone-wizard .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
     .site-map-zone-wizard .actions .btn{padding:4px 10px;font-size:.85rem}
-    body.map-workspace-open{overflow:hidden}
+    body.map-workspace-open{overflow:auto}
     .site-map-wizard{display:none;margin-top:10px;border:1px solid var(--border);border-radius:12px;background:#fff;padding:12px}
     .site-map-wizard.show{display:block}
     .site-map-wizard .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:8px}
@@ -2270,7 +2433,7 @@ HTML = """<!doctype html>
     .site-map-wizard .step .s{font-size:.82rem;color:var(--muted);margin-top:4px}
     .site-map-wizard .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
     .site-map-card.workspace .site-map-wizard.show{
-      position:sticky; top:70px; z-index:1910; margin-top:8px;
+      position:static; z-index:auto; margin-top:8px;
       display:flex; flex-direction:column; gap:8px;
       padding:10px; border-radius:12px;
       box-shadow:0 10px 24px rgba(10,31,44,.12);
@@ -2303,9 +2466,9 @@ HTML = """<!doctype html>
     .site-map-card.workspace .site-map-wizard.compact-early .steps{margin-top:4px}
     .site-map-card.workspace .site-map-wizard.compact-early .step{min-width:130px}
     .site-map-card.workspace .site-map-wizard.compact-early.show{
-      position:absolute; top:126px; left:10px; right:10px; z-index:1915;
-      max-height:min(34vh,220px); overflow:auto;
-      margin-top:0;
+      position:static; z-index:auto;
+      max-height:none; overflow:visible;
+      margin-top:8px;
     }
     .site-map-card.workspace .site-map-wizard.compact-early.show .steps{display:none}
     .site-map-card.workspace .site-map-wizard.compact-early.show #siteMapOutlineProgress{display:none}
@@ -2361,10 +2524,11 @@ HTML = """<!doctype html>
       .temp { font-size:1.35rem; }
       .form-grid{grid-template-columns:1fr}
       .site-map-tools,.site-map-subtools{grid-template-columns:1fr}
+      .site-map-plan-tools{grid-template-columns:1fr}
       .site-map-workspace-bar{flex-direction:column;align-items:stretch}
       .site-map-workspace-bar .left,.site-map-workspace-bar .right{width:100%}
-      .site-map-card.workspace{inset:8px}
-      .site-map-card.workspace .site-map-wizard.show{top:8px}
+      .site-map-card.workspace{inset:auto}
+      .site-map-card.workspace .site-map-wizard.show{position:static}
       #siteMapCanvas{height:320px}
       table,thead,tbody,th,td,tr { display:block; }
       thead { display:none; }
@@ -2384,6 +2548,7 @@ HTML = """<!doctype html>
         </div>
         <h1 id=\"hubTitle\">Heating Hub</h1>
         <div class=\"meta\">Main Boiler Zone(s) + Heating Zones</div>
+        <div id=\"outdoorTop\" class=\"outside-temp-badge\" title=\"Outside temperature\">Outside: --</div>
       </div>
       <div style=\"display:flex;gap:8px;flex-wrap:wrap\">
         <div class=\"head-action-wrap\">
@@ -2451,7 +2616,7 @@ HTML = """<!doctype html>
       <div class=\"chart-head\">
         <div>
           <h3>Building Map Preview</h3>
-          <div class=\"smallnote\">Satellite overhead preview auto-framed to the saved building outline with color-matched zone pins and branch lines.</div>
+          <div class=\"smallnote\">Visual building map of heating zone and equipment locations.</div>
         </div>
         <div>
           <button type=\"button\" class=\"btn\" id=\"mainMapPreviewEditZonesBtn\" style=\"padding:4px 10px;margin-right:6px\">Edit Zone Map</button>
@@ -2513,9 +2678,9 @@ HTML = """<!doctype html>
       <div class=\"chart-head\">
         <h3>Call Cycles & Performance (Zone 1 Main)</h3>
         <div class=\"btns\" id=\"cycleBtns\">
-          <button class=\"btn active\" data-cycle-range=\"24h\">24H</button>
+          <button class=\"btn\" data-cycle-range=\"24h\">24H</button>
           <button class=\"btn\" data-cycle-range=\"7d\">7D</button>
-          <button class=\"btn\" data-cycle-range=\"30d\">30D</button>
+          <button class=\"btn active\" data-cycle-range=\"30d\">30D</button>
         </div>
       </div>
       <div style=\"display:flex;justify-content:flex-end;margin-top:8px\">
@@ -2924,11 +3089,19 @@ HTML = """<!doctype html>
           <div class=\"smallnote\">Enter the building address, zoom in, then select a zone/device and click the map to place a rough pin location.</div>
           <div class=\"site-map-tools\" style=\"margin-top:10px\">
             <div class=\"full\" style=\"min-width:320px\">
-              <label class=\"label\">Building Address (Step 1)</label>
-              <div class=\"form-grid\" style=\"margin-top:4px\">
+              <div class=\"site-address-header\">
+                <label class=\"label\" style=\"margin:0\">Building Address (Step 1)</label>
+                <button type=\"button\" class=\"btn\" id=\"siteAddressEditToggleBtn\" style=\"padding:4px 10px\">Edit Building Address</button>
+              </div>
+              <div id=\"siteAddressEditor\" class=\"site-address-editor\">
+              <div class=\"form-grid\" style=\"margin-top:6px\">
                 <div class=\"full\">
                   <label class=\"label\" for=\"siteAddrStreet\">Full Building Address (Number + Street)</label>
                   <input id=\"siteAddrStreet\" class=\"input\" placeholder=\"165 Water Street\">
+                </div>
+                <div>
+                  <label class=\"label\" for=\"siteAddrCity\">City / Town</label>
+                  <input id=\"siteAddrCity\" class=\"input\" placeholder=\"Norwalk\">
                 </div>
                 <div>
                   <label class=\"label\" for=\"siteAddrZip\">ZIP</label>
@@ -2938,15 +3111,30 @@ HTML = """<!doctype html>
                   <label class=\"label\" for=\"siteAddrState\">State</label>
                   <input id=\"siteAddrState\" class=\"input\" placeholder=\"CT\" maxlength=\"2\" autocapitalize=\"characters\">
                 </div>
+                <div style=\"display:flex;align-items:end;justify-content:flex-end\">
+                  <button type=\"button\" class=\"btn\" id=\"siteMapFindBtn\">Find Address</button>
+                </div>
+              </div>
               </div>
               <input id=\"siteAddress\" class=\"input\" type=\"hidden\" placeholder=\"165 Water Street, New Haven, CT\">
             </div>
             <div id=\"siteMapZoneSelectWrap\">
               <label class=\"label\" for=\"siteMapZoneSelect\">Zone / Device</label>
               <select id=\"siteMapZoneSelect\" class=\"select\"></select>
-              <div class=\"smallnote\">Only adopted/assigned zone devices appear here (plus Zone 1 and Zone 2 main).</div>
+              <div class=\"smallnote\">Includes main zones, adopted devices, and unassigned planned zones.</div>
             </div>
-            <button type=\"button\" class=\"btn\" id=\"siteMapFindBtn\">Find Address</button>
+            <div class=\"full\" id=\"siteMapPlannedZoneWrap\">
+              <label class=\"label\">Add Zone Without Device (Optional)</label>
+              <div class=\"site-map-plan-tools\" style=\"margin-top:4px\">
+                <input id=\"siteMapPlannedZoneName\" class=\"input\" placeholder=\"Example: 1st Floor Production / AV Coil / Men's Bathroom\">
+                <select id=\"siteMapPlannedParent\" class=\"select\">
+                  <option value=\"Zone 1\">Zone 1</option>
+                  <option value=\"Zone 2\">Zone 2</option>
+                </select>
+                <button type=\"button\" class=\"btn\" id=\"siteMapAddPlannedZoneBtn\">Add + Map Zone</button>
+              </div>
+              <div class=\"smallnote\">Adds the zone, opens map workflow, and lets you place pin/area and full details now. Device assignment can be done later.</div>
+            </div>
             <button type=\"button\" class=\"btn active\" id=\"siteMapSaveBtn\">Save Map</button>
           </div>
           <div id=\"siteMapZoneMappingLockedNote\" class=\"msg\" style=\"display:none;margin-top:8px\">Complete Building Setup first (find address, confirm building pin, draw outline, and save floor count). Zone/device mapping unlocks after that and uses this shared building layout for all zones.</div>
@@ -3156,7 +3344,7 @@ HTML = """<!doctype html>
             </div>
             <div id=\"siteMapZoneWizardDownstreamActions\" class=\"actions hidden\">
               <button type=\"button\" class=\"btn active\" id=\"siteMapZoneWizardSaveProgressBtnDs\">Save Progress</button>
-              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardLoadSelectedBtn\">Use Selected Device</button>
+              <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardLoadSelectedBtn\">Use Selected Zone</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardRefreshZoneBtn\">Refresh Zone Selection</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardStartAreaBtn\">Start Zone Area (Optional)</button>
               <button type=\"button\" class=\"btn\" id=\"siteMapZoneWizardClearOutsidePinsBtnDs\">Clear Pins Outside Building</button>
@@ -3319,6 +3507,30 @@ HTML = """<!doctype html>
       <div id=\"siteMapResetBuildingMsg\" class=\"msg\" style=\"margin-top:8px\"></div>
     </div>
   </div>
+  <div id=\"siteMapPinPlacedModal\" class=\"site-confirm-modal\" aria-hidden=\"true\">
+    <div class=\"site-confirm-modal-card\">
+      <div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px\">
+        <h4 style=\"margin:0\">Zone Pin Placed</h4>
+        <button type=\"button\" class=\"btn\" id=\"siteMapPinPlacedCloseBtn\">Close</button>
+      </div>
+      <div class=\"smallnote\" id=\"siteMapPinPlacedText\" style=\"margin-top:8px\">Pin placed.</div>
+      <div style=\"display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:12px\">
+        <button type=\"button\" class=\"btn active\" id=\"siteMapPinPlacedSaveFinishBtn\">Save & Finish</button>
+        <button type=\"button\" class=\"btn\" id=\"siteMapPinPlacedSkipBtn\">Skip, Set Up Later</button>
+      </div>
+    </div>
+  </div>
+  <div id=\"siteMapPostSaveModal\" class=\"site-confirm-modal\" aria-hidden=\"true\">
+    <div class=\"site-confirm-modal-card\">
+      <h4 style=\"margin:0\">Next Step</h4>
+      <div class=\"smallnote\" id=\"siteMapPostSaveText\" style=\"margin-top:8px\">Choose what to do next.</div>
+      <div style=\"display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:12px\">
+        <button type=\"button\" class=\"btn\" id=\"siteMapPostSaveDetailsBtn\">Add More Details to Zone</button>
+        <button type=\"button\" class=\"btn active\" id=\"siteMapPostSaveReturnBtn\">Save & Return to Main Dashboard</button>
+        <button type=\"button\" class=\"btn\" id=\"siteMapPostSaveAnotherBtn\">Set Up Another Zone</button>
+      </div>
+    </div>
+  </div>
   <div id=\"zoneInfoModal\" class=\"zone-info-modal\" aria-hidden=\"true\">
     <div class=\"zone-info-card\">
       <div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px\">
@@ -3366,9 +3578,68 @@ HTML = """<!doctype html>
   </div>
 
   <script>
+    // Boot fallback: keep building selector + main temps usable even if the main script fails.
+    (function () {
+      try {
+        const sel = document.getElementById("buildingSwitcher");
+        if (sel) {
+          fetch(`/api/buildings?_=${Date.now()}`, { cache: "no-store" })
+            .then((r) => r.json())
+            .then((cfg) => {
+              const rows = Array.isArray(cfg && cfg.buildings) ? cfg.buildings : [];
+              const active = String((cfg && cfg.active_building_id) || "local");
+              if (!rows.length) return;
+              sel.innerHTML = "";
+              rows.forEach((b) => {
+                const op = document.createElement("option");
+                op.value = String((b && b.id) || "");
+                op.textContent = String((b && b.name) || (b && b.id) || "Building");
+                sel.appendChild(op);
+              });
+              if (Array.from(sel.options).some((o) => o.value === active)) sel.value = active;
+            })
+            .catch(() => {});
+        }
+        const setTemp = (name, obj) => {
+          const val = document.getElementById(name);
+          const sid = document.getElementById(name + "_sid");
+          if (sid) sid.textContent = (obj && obj.sensor_id) ? String(obj.sensor_id) : "--";
+          if (val) val.textContent = (obj && obj.temp_f != null) ? Number(obj.temp_f).toFixed(1) : "--";
+        };
+        fetch(`/api/temps?_=${Date.now()}`, { cache: "no-store" })
+          .then((r) => r.json())
+          .then((d) => {
+            const rr = (d && d.readings) || {};
+            setTemp("feed_1", rr.feed_1 || {});
+            setTemp("return_1", rr.return_1 || {});
+            setTemp("feed_2", rr.feed_2 || {});
+            setTemp("return_2", rr.return_2 || {});
+            const call = document.getElementById("zone1_call_status");
+            if (call) call.textContent = String((d && d.main_call_status) || "24VAC Signal Unknown");
+            const st = document.getElementById("zone1_status");
+            if (st) st.textContent = String((d && d.zone1_status_label) || "--");
+          })
+          .catch(() => {});
+        fetch(`/api/hub?_=${Date.now()}`, { cache: "no-store" })
+          .then((r) => r.json())
+          .then((d) => {
+            const out = document.getElementById("outdoorTop");
+            const o = (d && d.outdoor) || {};
+            const tf = Number(o.temp_f);
+            if (out) {
+              out.textContent = Number.isFinite(tf) ? `Outside: ${tf.toFixed(1)}°F` : "Outside: --";
+              out.title = Number.isFinite(tf) ? "Outside temperature" : "Outside temperature unavailable";
+            }
+          })
+          .catch(() => {});
+      } catch (_e) {}
+    })();
+  </script>
+
+  <script>
     const BUILDING_SWITCH_ADD_VALUE = "__add__";
     let activeRange = "live";
-    let activeCycleRange = "24h";
+    let activeCycleRange = "30d";
     let activeCycleZoneId = "zone1_main";
     let cycleZoneDefs = [];
     let currentTabId = "zone1_main";
@@ -3416,6 +3687,8 @@ HTML = """<!doctype html>
     let siteMapWorkspaceOpen = false;
     let siteMapSetupMode = "none";
     let siteMapReady = false;
+    let siteAddressEditorCollapsed = false;
+    let siteMapLastPlacedZoneId = "";
     let mainMapPreviewLastRenderKey = "";
     let siteMapAutoOpenZoneSetupAfterBuildingSave = false;
     let siteMapPendingOutlineConfirmSourceLabel = "";
@@ -3448,6 +3721,38 @@ HTML = """<!doctype html>
       el.textContent = label || "--";
     }
 
+    function outsideTempLocationLabel() {
+      const activeB = activeBuildingProfile();
+      const raw = String((activeB && activeB.address) || (siteMapConfig && siteMapConfig.address) || "").trim();
+      if (!raw) return "";
+      const parts = raw.split(",").map((s) => String(s || "").trim()).filter(Boolean);
+      const city = parts.length >= 2 ? parts[1] : "";
+      const z = raw.match(/\b(\d{5}(?:-\d{4})?)\b/);
+      const zip = z ? String(z[1]) : "";
+      const out = [city, zip].filter(Boolean).join(" ");
+      return out;
+    }
+
+    function setOutdoorTop(outdoor) {
+      const el = document.getElementById("outdoorTop");
+      if (!el) return;
+      const o = (outdoor && typeof outdoor === "object") ? outdoor : {};
+      const tf = Number(o.temp_f);
+      const loc = outsideTempLocationLabel();
+      if (Number.isFinite(tf)) {
+        const stale = String(o.status || "").toLowerCase() === "stale";
+        el.textContent = `Outside: ${tf.toFixed(1)}°F${stale ? "*" : ""}${loc ? ` · ${loc}` : ""}`;
+        el.title = stale
+          ? `Outside temperature (stale cached reading)${loc ? ` - ${loc}` : ""}`
+          : `Outside temperature${loc ? ` - ${loc}` : ""}`;
+      } else {
+        el.textContent = `Outside: --${loc ? ` · ${loc}` : ""}`;
+        el.title = String(o.status || "").toLowerCase() === "no-location"
+          ? "Outside temperature unavailable: set building map center first"
+          : "Outside temperature unavailable";
+      }
+    }
+
     function pinColorHex(name) {
       const m = {
         red: "#dc2626",
@@ -3473,12 +3778,40 @@ HTML = """<!doctype html>
       if (p === "zone 3") return "green";
       return "purple";
     }
+    function normalizeParentZoneName(parentZone) {
+      const p = String(parentZone || "").trim().toLowerCase();
+      if (p === "zone 2" || p === "zone2" || p === "2") return "Zone 2";
+      return "Zone 1";
+    }
+    function plannedZonesFromSiteMapConfig() {
+      if (!siteMapConfig || typeof siteMapConfig !== "object") return [];
+      const rows = Array.isArray(siteMapConfig.planned_zones) ? siteMapConfig.planned_zones : [];
+      return rows
+        .filter((row) => row && typeof row === "object")
+        .map((row) => {
+          const id = String(row.id || "").trim();
+          if (!id) return null;
+          return {
+            id,
+            label: String(row.label || id).trim() || id,
+            parent_zone: normalizeParentZoneName(row.parent_zone || "Zone 1"),
+          };
+        })
+        .filter(Boolean);
+    }
+    function plannedZoneById(zoneId) {
+      const zid = String(zoneId || "").trim();
+      if (!zid) return null;
+      return plannedZonesFromSiteMapConfig().find((z) => z.id === zid) || null;
+    }
     function preferredPinColorForZone(zoneId) {
       if (zoneId === "zone1_main") return "red";
       if (zoneId === "zone2_main") return "blue";
       const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
       const row = ds.find((z) => String(z.id || "") === String(zoneId || ""));
       if (row) return parentZoneColorName(row.parent_zone);
+      const planned = plannedZoneById(zoneId);
+      if (planned) return parentZoneColorName(planned.parent_zone);
       return "red";
     }
 
@@ -3571,6 +3904,76 @@ HTML = """<!doctype html>
       if (el) el.textContent = msg || "";
     }
 
+    function buildingAddressLockedIn() {
+      const hasAddress = !!String((siteMapConfig && siteMapConfig.address) || "").trim();
+      const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      return hasAddress && hasOutline;
+    }
+
+    function renderSiteAddressEditorState() {
+      const editor = document.getElementById("siteAddressEditor");
+      const btn = document.getElementById("siteAddressEditToggleBtn");
+      if (editor) editor.classList.toggle("collapsed", !!siteAddressEditorCollapsed);
+      if (btn) btn.textContent = siteAddressEditorCollapsed ? "Edit Building Address" : "Hide Building Address";
+    }
+
+    function setSiteAddressEditorCollapsed(nextCollapsed, options = {}) {
+      const force = !!(options && options.force);
+      if (!force && siteMapSetupMode === "zone-main") return;
+      if (!force && siteMapSetupMode === "zone-downstream") return;
+      siteAddressEditorCollapsed = !!nextCollapsed;
+      renderSiteAddressEditorState();
+    }
+
+    function forceBuildingAddressSearchVisible(stepMsg = "") {
+      setSiteMapSetupMode("building");
+      const card = document.getElementById("siteMapCard");
+      if (card) {
+        card.classList.remove("step-map-focus");
+        card.classList.remove("zone-setup-mode");
+        card.classList.add("building-setup-mode");
+      }
+      const tools = document.querySelector("#siteMapCard .site-map-tools");
+      if (tools) tools.style.display = "";
+      siteAddressEditorCollapsed = false;
+      renderSiteAddressEditorState();
+      const addressField = document.getElementById("siteAddrStreet");
+      const outerAddressWrap = document.getElementById("siteAddress")?.closest("div");
+      if (outerAddressWrap) {
+        outerAddressWrap.classList.remove("hidden");
+        outerAddressWrap.style.display = "";
+      }
+      const addressGrid = outerAddressWrap ? outerAddressWrap.querySelector(".form-grid") : null;
+      if (addressGrid) addressGrid.style.display = "";
+      const streetRowWrap = addressField ? addressField.closest(".full") : null;
+      if (streetRowWrap) {
+        streetRowWrap.classList.remove("hidden");
+        streetRowWrap.style.display = "";
+      }
+      const zip = document.getElementById("siteAddrZip");
+      const state = document.getElementById("siteAddrState");
+      if (zip) { zip.disabled = false; zip.readOnly = false; }
+      if (state) { state.disabled = false; state.readOnly = false; }
+      const findBtn = document.getElementById("siteMapFindBtn");
+      if (findBtn) {
+        findBtn.classList.remove("hidden");
+        findBtn.style.display = "";
+      }
+      if (addressField) {
+        addressField.disabled = false;
+        addressField.readOnly = false;
+        try {
+          if (card && card.classList.contains("workspace")) {
+            card.scrollTo({ top: Math.max(0, Number((outerAddressWrap?.offsetTop || streetRowWrap?.offsetTop || addressField.offsetTop || 0) - 8)), behavior: "smooth" });
+          } else {
+            addressField.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        } catch (_e) {}
+        focusNoScroll(addressField, { select: true });
+      }
+      if (stepMsg) setOutlineWizardMsg(stepMsg);
+    }
+
     function renderOutlineWizardProgress(state) {
       const el = document.getElementById("siteMapOutlineProgress");
       if (!el) return;
@@ -3627,7 +4030,11 @@ HTML = """<!doctype html>
         el.classList.toggle("next-required", n === nextRequired && !doneByStep[n]);
       });
       if (wiz) wiz.classList.toggle("compact-early", !!siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) <= 3);
-      if (card) card.classList.toggle("step-map-focus", !!siteMapWorkspaceOpen && !!siteMapOutlineWizardOpen && [2,3].includes(Number(siteMapOutlineWizardStep || 1)));
+      // Keep controls visible; hiding them by step caused the address field to disappear.
+      if (card) card.classList.remove("step-map-focus");
+      if (siteMapOutlineWizardOpen && Number(siteMapOutlineWizardStep || 1) === 1) {
+        forceBuildingAddressSearchVisible();
+      }
       renderOutlineWizardProgress({ hasAddress, hasConfirm, hasOutline, drawing });
       updateOutlineWizardActionStates({ hasAddress, hasConfirm, hasOutline, drawing });
     }
@@ -3798,11 +4205,12 @@ HTML = """<!doctype html>
 
     function buildSiteAddressQueryFromFields() {
       const street = String(document.getElementById("siteAddrStreet")?.value || "").trim();
+      const city = String(document.getElementById("siteAddrCity")?.value || "").trim();
       const zip = String(document.getElementById("siteAddrZip")?.value || "").trim();
       const state = String(document.getElementById("siteAddrState")?.value || "").trim().toUpperCase();
       const looksLikeFullAddress = street.includes(",");
-      const tail = [state, zip].filter(Boolean).join(" ");
-      const q = looksLikeFullAddress ? street : [street, tail].filter(Boolean).join(", ");
+      const stateZip = [state, zip].filter(Boolean).join(" ");
+      const q = looksLikeFullAddress ? street : [street, city, stateZip].filter(Boolean).join(", ");
       const hidden = document.getElementById("siteAddress");
       if (hidden) hidden.value = q;
       const stateEl = document.getElementById("siteAddrState");
@@ -3810,18 +4218,24 @@ HTML = """<!doctype html>
       return q;
     }
 
-    function ensureAddressDatalist(inputId) {
+    function ensureAddressSuggestBox(inputId) {
       const input = document.getElementById(inputId);
       if (!input) return null;
-      const listId = `${inputId}_suggestions`;
-      let dl = document.getElementById(listId);
-      if (!dl) {
-        dl = document.createElement("datalist");
-        dl.id = listId;
-        document.body.appendChild(dl);
+      const host = input.parentElement;
+      if (host) {
+        const pos = (window.getComputedStyle(host).position || "").toLowerCase();
+        if (!pos || pos === "static") host.style.position = "relative";
       }
-      input.setAttribute("list", listId);
-      return dl;
+      const boxId = `${inputId}_suggestions`;
+      let box = document.getElementById(boxId);
+      if (!box) {
+        box = document.createElement("div");
+        box.id = boxId;
+        box.className = "addr-suggest";
+        box.setAttribute("role", "listbox");
+        (host || document.body).appendChild(box);
+      }
+      return box;
     }
 
     function parseStateZipFromAddressText(addr) {
@@ -3831,32 +4245,92 @@ HTML = """<!doctype html>
       return { state: String(m[1] || "").toUpperCase(), zip: String(m[2] || "") };
     }
 
+    function parsePickedAddressParts(picked) {
+      const out = { street: "", city: "", state: "", zip: "" };
+      if (!picked || typeof picked !== "object") return out;
+      const addr = (picked.address && typeof picked.address === "object") ? picked.address : {};
+      const house = String(addr.house_number || "").trim();
+      const road = String(addr.road || addr.pedestrian || addr.footway || "").trim();
+      out.street = [house, road].filter(Boolean).join(" ").trim();
+      out.city = String(
+        addr.city || addr.town || addr.village || addr.hamlet || addr.municipality || addr.suburb || ""
+      ).trim();
+      const rawState = String(addr.state_code || "").trim().toUpperCase() || String(addr.state || "").trim();
+      if (/^[A-Za-z]{2}$/.test(rawState)) out.state = rawState.toUpperCase();
+      out.zip = String(addr.postcode || "").trim();
+
+      const display = String(picked.display_name || "").trim();
+      const segs = display.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!out.street && segs.length) out.street = segs[0];
+      if (!out.city && segs.length >= 2) out.city = segs[1];
+      if (!out.state || !out.zip) {
+        const parsed = parseStateZipFromAddressText(display);
+        if (!out.state && parsed.state) out.state = parsed.state;
+        if (!out.zip && parsed.zip) out.zip = parsed.zip;
+      }
+      if (!out.street) out.street = display;
+      return out;
+    }
+
     function initAddressAutocomplete(inputId, onPick) {
       const input = document.getElementById(inputId);
       if (!input) return;
-      const dl = ensureAddressDatalist(inputId);
-      if (!dl) return;
-      addressSuggestState[inputId] = { items: [], timer: null, controller: null };
+      const box = ensureAddressSuggestBox(inputId);
+      if (!box) return;
+      addressSuggestState[inputId] = { items: [], timer: null, controller: null, activeIndex: -1 };
+      const close = () => {
+        const state = addressSuggestState[inputId];
+        if (state) state.activeIndex = -1;
+        box.classList.remove("show");
+      };
+      const choose = (picked) => {
+        if (!picked || !picked.display_name) return;
+        input.value = String(picked.display_name);
+        close();
+        if (typeof onPick === "function") onPick(picked);
+      };
+      const setActive = (idx) => {
+        const state = addressSuggestState[inputId];
+        if (!state) return;
+        const btns = Array.from(box.querySelectorAll(".item"));
+        if (!btns.length) { state.activeIndex = -1; return; }
+        if (idx < 0) idx = btns.length - 1;
+        if (idx >= btns.length) idx = 0;
+        state.activeIndex = idx;
+        btns.forEach((b, i) => b.classList.toggle("active", i === idx));
+      };
       const render = (items) => {
-        dl.innerHTML = "";
-        (items || []).slice(0, 5).forEach((r) => {
+        box.innerHTML = "";
+        const rows = (items || []).slice(0, 5);
+        if (!rows.length) {
+          close();
+          return;
+        }
+        rows.forEach((r, i) => {
           if (!r || !r.display_name) return;
-          const op = document.createElement("option");
-          op.value = String(r.display_name);
-          dl.appendChild(op);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "item";
+          btn.textContent = String(r.display_name);
+          btn.addEventListener("mousedown", (e) => e.preventDefault());
+          btn.addEventListener("click", () => choose(r));
+          box.appendChild(btn);
         });
+        box.classList.add("show");
+        setActive(0);
       };
       const maybePick = () => {
         const state = addressSuggestState[inputId] || {};
         const value = String(input.value || "").trim();
         if (!value) return;
         const picked = (state.items || []).find((r) => String(r.display_name || "") === value);
-        if (picked && typeof onPick === "function") onPick(picked);
+        if (picked) choose(picked);
       };
       const search = async () => {
         const q = String(input.value || "").trim();
         if (q.length < 4) {
-          addressSuggestState[inputId].items = [];
+          const st = addressSuggestState[inputId];
+          if (st) st.items = [];
           render([]);
           return;
         }
@@ -3884,29 +4358,55 @@ HTML = """<!doctype html>
         if (state.timer) clearTimeout(state.timer);
         state.timer = setTimeout(search, 220);
       });
+      input.addEventListener("keydown", (e) => {
+        const state = addressSuggestState[inputId] || {};
+        const open = box.classList.contains("show");
+        if (e.key === "ArrowDown" && open) { e.preventDefault(); setActive((state.activeIndex ?? -1) + 1); }
+        if (e.key === "ArrowUp" && open) { e.preventDefault(); setActive((state.activeIndex ?? 0) - 1); }
+        if (e.key === "Enter" && open) {
+          const pick = (state.items || [])[state.activeIndex >= 0 ? state.activeIndex : 0];
+          if (pick) { e.preventDefault(); choose(pick); }
+        }
+        if (e.key === "Escape") close();
+      });
       input.addEventListener("change", maybePick);
-      input.addEventListener("blur", maybePick);
+      input.addEventListener("blur", () => setTimeout(() => { maybePick(); close(); }, 120));
+      document.addEventListener("click", (e) => {
+        if (e.target === input) return;
+        if (box.contains(e.target)) return;
+        close();
+      });
     }
 
     function initSiteMapAddressStepFields() {
       const street = document.getElementById("siteAddrStreet");
+      const city = document.getElementById("siteAddrCity");
       const zip = document.getElementById("siteAddrZip");
       const state = document.getElementById("siteAddrState");
       const findBtn = document.getElementById("siteMapFindBtn");
       initAddressAutocomplete("siteAddrStreet", (picked) => {
-        const a = String((picked && picked.display_name) || "").trim();
-        if (!a) return;
+        const parts = parsePickedAddressParts(picked);
+        const q = [parts.street, parts.city, [parts.state, parts.zip].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+        if (!q) return;
         const streetEl = document.getElementById("siteAddrStreet");
+        const cityEl = document.getElementById("siteAddrCity");
         const hiddenEl = document.getElementById("siteAddress");
         const stateEl = document.getElementById("siteAddrState");
         const zipEl = document.getElementById("siteAddrZip");
-        if (streetEl) streetEl.value = a;
-        if (hiddenEl) hiddenEl.value = a;
-        const parsed = parseStateZipFromAddressText(a);
-        if (stateEl && parsed.state) stateEl.value = parsed.state;
-        if (zipEl && parsed.zip) zipEl.value = parsed.zip;
+        if (streetEl) streetEl.value = parts.street || "";
+        if (cityEl) cityEl.value = parts.city || "";
+        if (stateEl && parts.state) stateEl.value = parts.state;
+        if (zipEl && parts.zip) zipEl.value = parts.zip;
+        if (hiddenEl) hiddenEl.value = q;
       });
       if (street) street.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const sugg = document.getElementById("siteAddrStreet_suggestions");
+        if (sugg && sugg.classList.contains("show")) return;
+        e.preventDefault();
+        focusNoScroll(city || zip || state || findBtn);
+      });
+      if (city) city.addEventListener("keydown", (e) => {
         if (e.key !== "Enter") return;
         e.preventDefault();
         focusNoScroll(zip || state || findBtn);
@@ -3946,7 +4446,8 @@ HTML = """<!doctype html>
       if (!canvas) return;
       const behavior = opts.behavior || "smooth";
       const pad = Number.isFinite(Number(opts.pad)) ? Number(opts.pad) : 8;
-      if (card && card.classList.contains("workspace")) {
+      const cardCanScroll = !!(card && card.classList.contains("workspace") && (card.scrollHeight > card.clientHeight + 4) && /(auto|scroll)/.test(String(window.getComputedStyle(card).overflow || "")));
+      if (cardCanScroll) {
         try {
           const top = Math.max(0, Number(canvas.offsetTop || 0) - pad);
           card.scrollTo({ top, behavior });
@@ -3956,6 +4457,22 @@ HTML = """<!doctype html>
       } else {
         try { canvas.scrollIntoView({ behavior, block: "start" }); } catch (_e) {}
       }
+    }
+
+    function forceMapIntoViewAfterAddressLookup() {
+      const canvas = document.getElementById("siteMapCanvas");
+      const card = document.getElementById("siteMapCard");
+      if (!canvas) return;
+      const scrollNow = () => {
+        scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
+        try { canvas.scrollIntoView({ behavior: "smooth", block: "start" }); } catch (_e) {}
+        if (card && card.classList.contains("workspace")) {
+          try { card.scrollTop = Math.max(0, Number(canvas.offsetTop || 0) - 8); } catch (_e) {}
+        }
+      };
+      setTimeout(scrollNow, 0);
+      setTimeout(scrollNow, 150);
+      setTimeout(scrollNow, 350);
     }
 
     function applyOutlineWizardStepAssist(step, opts = {}) {
@@ -3968,10 +4485,24 @@ HTML = """<!doctype html>
         }
         if (s === 1) {
           centerMapOnAddressOrDefault(17);
-          focusNoScroll(document.getElementById("siteAddrStreet") || document.getElementById("siteAddress"));
+          const addressWrap = document.getElementById("siteAddress")?.closest("div");
+          if (addressWrap) addressWrap.classList.remove("hidden");
+          const input = document.getElementById("siteAddrStreet") || document.getElementById("siteAddress");
+          if (input) {
+            try {
+              const card = document.getElementById("siteMapCard");
+              if (card && card.classList.contains("workspace")) {
+                card.scrollTo({ top: Math.max(0, Number((addressWrap?.offsetTop || input.offsetTop || 0) - 8)), behavior: "smooth" });
+              } else {
+                input.scrollIntoView({ behavior: "smooth", block: "center" });
+              }
+            } catch (_e) {}
+          }
+          focusNoScroll(input, { select: true });
           return;
         }
         if (s === 2) {
+          forceMapIntoViewAfterAddressLookup();
           focusNoScroll(document.getElementById("siteMapCanvas"));
           return;
         }
@@ -4082,6 +4613,107 @@ HTML = """<!doctype html>
       if (msg) msg.textContent = "";
     }
 
+    function openSiteMapPinPlacedModal(zoneId) {
+      const modal = document.getElementById("siteMapPinPlacedModal");
+      if (!modal) return;
+      siteMapLastPlacedZoneId = String(zoneId || selectedSiteMapZoneId() || "");
+      const zid = siteMapLastPlacedZoneId;
+      const label = (siteMapZoneOptions().find((o) => o.id === zid) || {}).label || zid || "zone";
+      const text = document.getElementById("siteMapPinPlacedText");
+      if (text) text.textContent = `${label} pin placed. Add details now, then Save & Finish, or skip and set up later.`;
+      modal.classList.add("show");
+      modal.setAttribute("aria-hidden", "false");
+    }
+
+    function closeSiteMapPinPlacedModal() {
+      const modal = document.getElementById("siteMapPinPlacedModal");
+      if (!modal) return;
+      modal.classList.remove("show");
+      modal.setAttribute("aria-hidden", "true");
+    }
+
+    function openSiteMapPostSaveModal(message) {
+      const modal = document.getElementById("siteMapPostSaveModal");
+      if (!modal) return;
+      const text = document.getElementById("siteMapPostSaveText");
+      if (text) text.textContent = String(message || "Zone saved. Choose what to do next.");
+      modal.classList.add("show");
+      modal.setAttribute("aria-hidden", "false");
+    }
+
+    function closeSiteMapPostSaveModal() {
+      const modal = document.getElementById("siteMapPostSaveModal");
+      if (!modal) return;
+      modal.classList.remove("show");
+      modal.setAttribute("aria-hidden", "true");
+    }
+
+    async function completePinSetupSaveAndChooseNext(skipDetails = false) {
+      const zid = String(siteMapLastPlacedZoneId || selectedSiteMapZoneId() || "");
+      if (!zid) return;
+      const sel = document.getElementById("siteMapZoneSelect");
+      if (sel) sel.value = zid;
+      syncSiteMapDetailsFormFromSelected();
+      if (!skipDetails) applySelectedSiteMapDetails();
+      await saveSiteMapConfig();
+      closeSiteMapPinPlacedModal();
+      openSiteMapPostSaveModal(
+        skipDetails
+          ? "Pin saved. You can finish details later from Zone Setup."
+          : "Zone details saved and added to map."
+      );
+    }
+
+    async function saveAndReturnToMainDashboard() {
+      await saveSiteMapConfig();
+      closeSiteMapPinPlacedModal();
+      closeSiteMapPostSaveModal();
+      exitSiteMapWorkspace();
+      const admin = document.getElementById("adminToolsDetails");
+      if (admin) admin.open = false;
+      try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (_e) {}
+      setSiteMapMsg("Saved. Returned to main dashboard.");
+    }
+
+    async function saveAndSetupAnotherZone() {
+      await saveSiteMapConfig();
+      closeSiteMapPinPlacedModal();
+      closeSiteMapPostSaveModal();
+      openZoneSetupWorkspace("zone-downstream");
+      const unpinned = nextUnpinnedZoneId();
+      if (unpinned && !isMainZoneId(unpinned)) {
+        const sel = document.getElementById("siteMapZoneSelect");
+        if (sel) sel.value = String(unpinned);
+        syncSiteMapDetailsFormFromSelected();
+        useSelectedZoneSetupDevice();
+      } else {
+        setSiteMapMsg("No unpinned downstream zones left. Select any zone to edit.");
+      }
+    }
+
+    function continueEditingCurrentZoneDetails() {
+      const zid = String(siteMapLastPlacedZoneId || selectedSiteMapZoneId() || "");
+      closeSiteMapPinPlacedModal();
+      closeSiteMapPostSaveModal();
+      if (!zid) {
+        setSiteMapMsg("No zone selected to edit.");
+        return;
+      }
+      openZoneSetupWorkspace(isMainZoneId(zid) ? "zone-main" : "zone-downstream");
+      setTimeout(() => {
+        const sel = document.getElementById("siteMapZoneSelect");
+        if (sel) sel.value = zid;
+        syncSiteMapDetailsFormFromSelected();
+        centerMapOnZonePin(zid);
+        const detailsAnchor = document.getElementById("siteMapEquipType") || document.getElementById("siteMapPinColor");
+        if (detailsAnchor && typeof detailsAnchor.scrollIntoView === "function") {
+          try { detailsAnchor.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (_e) {}
+        }
+        focusNoScroll(document.getElementById("siteMapEquipType") || detailsAnchor);
+        setSiteMapMsg("Editing zone details. Update fields, then click Apply Details and Save & Finish.");
+      }, 120);
+    }
+
     function downloadBuildingSetupSnapshot() {
       const cfg = (siteMapConfig && typeof siteMapConfig === "object") ? siteMapConfig : {};
       const out = {
@@ -4095,6 +4727,7 @@ HTML = """<!doctype html>
         map_layer: String(cfg.map_layer || "street"),
         building_confirm_pin: cfg.building_confirm_pin || null,
         building_outline: cfg.building_outline || null,
+        planned_zones: Array.isArray(cfg.planned_zones) ? cfg.planned_zones : [],
         pins: (cfg.pins && typeof cfg.pins === "object") ? cfg.pins : {},
       };
       const blob = new Blob([JSON.stringify(out, null, 2) + "\\n"], { type: "application/json" });
@@ -4128,6 +4761,7 @@ HTML = """<!doctype html>
           map_layer: "street",
           building_confirm_pin: null,
           building_outline: null,
+          planned_zones: [],
           pins: {},
           updated_utc: new Date().toISOString(),
         };
@@ -4152,6 +4786,7 @@ HTML = """<!doctype html>
         closeResetBuildingModal();
         await saveSiteMapConfig();
         openBuildingOutlineWizard();
+        forceBuildingAddressSearchVisible("Step 1: enter the building address and click Find Address.");
         setOutlineWizardStep(1, "Building setup reset. Step 1: enter the building address and click Find Address.");
         setSiteMapMsg("Building setup reset. Start again with the building address.");
       } catch (e) {
@@ -4267,14 +4902,12 @@ HTML = """<!doctype html>
       const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
       return realDownstreamRows(ds).length > 0;
     }
+    function hasPlannedDownstreamZones() {
+      return plannedZonesFromSiteMapConfig().length > 0;
+    }
 
     function nextUnpinnedZoneId() {
-      const opts = siteMapZoneOptions().filter((o) => {
-        if (o.id === "zone1_main" || o.id === "zone2_main") return true;
-        const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
-        const row = ds.find((z) => String(z.id || "") === String(o.id));
-        return row ? isAdoptedZone(row) : false;
-      });
+      const opts = siteMapZoneOptions();
       for (const o of opts) {
         if (!getSiteMapPin(o.id)) return o.id;
       }
@@ -4365,7 +4998,7 @@ HTML = """<!doctype html>
           return;
         }
       }
-      const hasDownstream = hasRealDownstreamZones();
+      const hasDownstream = hasRealDownstreamZones() || hasPlannedDownstreamZones();
       if (!hasDownstream) {
         if (window.confirm("No additional zone devices are detected yet. Do you want to set up a new device now?")) {
           openSetupPanel();
@@ -4385,7 +5018,12 @@ HTML = """<!doctype html>
     function applyParentColorsToZones() {
       if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
       if (!siteMapConfig.pins || typeof siteMapConfig.pins !== "object") siteMapConfig.pins = {};
-      const zoneIds = ["zone1_main", "zone2_main", ...realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []).map(z => z.id)];
+      const zoneIds = [
+        "zone1_main",
+        "zone2_main",
+        ...realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []).map((z) => z.id),
+        ...plannedZonesFromSiteMapConfig().map((z) => z.id),
+      ];
       zoneIds.forEach((zid) => {
         if (!zid) return;
         const p = siteMapConfig.pins[zid];
@@ -4465,46 +5103,13 @@ HTML = """<!doctype html>
       setOutlineWizardStep(next);
     }
 
-    function goToPreviousOutlineWizardStep() {
+    async function goToPreviousOutlineWizardStep() {
       if (!siteMapOutlineWizardOpen) return;
       const cur = Math.max(1, Number(siteMapOutlineWizardStep || 1));
       if (cur <= 1) return;
       if (siteMapBuildingEditOnlyMode && cur === 3) {
-        const switchToLookup = window.confirm(
-          "Return to Building Lookup?\\n\\n" +
-          "Choose OK to leave outline edit mode and go back to Building Lookup.\\n" +
-          "Choose Cancel to stay in Edit Existing Outline."
-        );
-        if (!switchToLookup) {
-          setSiteMapMsg("Stayed in Edit Existing Outline.");
-          updateSiteMapWorkspaceStatus("Editing saved outline points");
-          return;
-        }
-        const saveBeforeLookup = window.confirm(
-          "Save current building setup changes before returning to Building Lookup?\\n\\n" +
-          "Choose OK to save now. Choose Cancel to continue without saving."
-        );
-        if (saveBeforeLookup) {
-          try {
-            saveSiteMapConfig();
-            setSiteMapMsg("Saved current building setup. Returning to Building Lookup.");
-          } catch (_e) {
-            setSiteMapMsg("Could not save building setup before returning. Continuing to Building Lookup.");
-          }
-        }
-        toggleBuildingOutlineDragMode(false);
-        siteMapEditingSavedOutlinePoints = false;
-        siteMapSelectedOutlinePointIndex = -1;
-        siteMapOutlinePointDragActive = false;
-        siteMapDrawingBuildingOutline = false;
-        siteMapDraftBuildingOutlinePoints = [];
-        renderSiteMapDraftBuildingOutline();
-        siteMapBuildingEditOnlyMode = false;
-        setSiteMapBaseLayer("street");
-        setOutlineWizardStep(1, "Building lookup override enabled. You can find/confirm a different building or continue editing the existing outline.", { skipAssist: true });
-        setSiteMapMsg("Returned to Building Setup lookup. Use Find Address to override the current building, or go back to Edit Existing Outline.");
-        updateSiteMapWorkspaceStatus("Building lookup override");
-        if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
+        // Deterministic behavior: this button always clears setup and returns to Step 1.
+        await resetBuildingSetupAndMap();
         return;
       }
       const prev = cur - 1;
@@ -4551,8 +5156,8 @@ HTML = """<!doctype html>
           status.textContent = "Zone Setup - Main Zones: The saved building outline is locked and shown on the satellite image. Choose Zone 1 or Zone 2, then place the main boiler/circulator pin inside the building outline. Set the floor in the map popup.";
         } else if (isDownstream) {
           status.textContent = hasSelectedDownstream
-            ? `Zone Setup - Downstream Zones: Selected device is ready. Place the pin inside the locked building outline, then draw an optional served area.`
-            : "Zone Setup - Downstream Zones: Step 1 is choose a downstream zone/device from the Zone / Device dropdown, then click Use Selected Device.";
+            ? `Zone Setup - Downstream Zones: Selected zone is ready. Place the pin inside the locked building outline, then draw an optional served area.`
+            : "Zone Setup - Downstream Zones: Step 1 is choose a downstream zone (adopted device or planned zone) from the Zone / Device dropdown, then click Use Selected Zone.";
         } else {
           status.textContent = "";
         }
@@ -5124,28 +5729,29 @@ HTML = """<!doctype html>
       });
       if (previewKey === mainMapPreviewLastRenderKey) return;
       mainMapPreviewLastRenderKey = previewKey;
-      // Frame the preview to the saved building outline only so misplaced pins
-      // do not zoom the entire preview far away from the building.
+      // Frame preview from building outline bounds, then use the SAME padded
+      // bounds for both background imagery and SVG projection coordinates.
       const ptsAll = [...ring];
       const minLat = Math.min(...ptsAll.map((p) => p.lat));
       const maxLat = Math.max(...ptsAll.map((p) => p.lat));
       const minLng = Math.min(...ptsAll.map((p) => p.lng));
       const maxLng = Math.max(...ptsAll.map((p) => p.lng));
-      const W = 1000, H = 560, pad = 44;
-      const bbPadLat = Math.max(0.00012, (maxLat - minLat) * 0.15);
-      const bbPadLng = Math.max(0.00012, (maxLng - minLng) * 0.15);
+      const W = 1000, H = 560, pad = 0;
+      // Slightly tighter framing so the building outline and satellite context are easier to read.
+      const bbPadLat = Math.max(0.00006, (maxLat - minLat) * 0.07);
+      const bbPadLng = Math.max(0.00006, (maxLng - minLng) * 0.07);
       const bgMinLat = minLat - bbPadLat;
       const bgMaxLat = maxLat + bbPadLat;
       const bgMinLng = minLng - bbPadLng;
       const bgMaxLng = maxLng + bbPadLng;
-      const dx = Math.max(0.000001, maxLng - minLng);
-      const dy = Math.max(0.000001, maxLat - minLat);
+      const dx = Math.max(0.000001, bgMaxLng - bgMinLng);
+      const dy = Math.max(0.000001, bgMaxLat - bgMinLat);
       const scale = Math.min((W - pad * 2) / dx, (H - pad * 2) / dy);
       const xOff = (W - dx * scale) / 2;
       const yOff = (H - dy * scale) / 2;
       const project = (lat, lng) => ({
-        x: xOff + (Number(lng) - minLng) * scale,
-        y: H - (yOff + (Number(lat) - minLat) * scale),
+        x: xOff + (Number(lng) - bgMinLng) * scale,
+        y: H - (yOff + (Number(lat) - bgMinLat) * scale),
       });
       const esc = (s) => String(s || "").replace(/[&<>"]/g, (m) => {
         if (m === "&") return "&amp;";
@@ -5574,9 +6180,10 @@ HTML = """<!doctype html>
       document.getElementById("cycleRespLagKpi").textContent = `${s.avg_response_lag_minutes ?? "--"}${(s.avg_response_lag_minutes ?? null) !== null ? " min" : ""}`;
       document.getElementById("cycleNoRespKpi").textContent = s.no_response_count ?? "--";
       const open = data && data.open_cycle;
+      const cycleCount = Number(s.cycle_count || 0);
       document.getElementById("cycleOpenNote").textContent = (open && open.active)
         ? `Current call active: ${open.runtime_minutes} min (open cycle)` + (open.response_reached ? ` · Response reached in ${open.response_lag_minutes} min` : "")
-        : "";
+        : (cycleCount === 0 ? `No call cycles recorded in ${String(activeCycleRange || "").toUpperCase()} for this zone.` : "");
     }
 
     async function refreshCycles() {
@@ -5645,18 +6252,21 @@ HTML = """<!doctype html>
         lastHubPayload = data;
         const r = (data.main && data.main.readings) ? data.main.readings : {};
         const downstream = data.downstream || [];
+        setOutdoorTop(data.outdoor || null);
 
         // Main readings are updated by refreshMain() so they remain visible even if hub polling is slow.
-        appendLivePoint(r, downstream, (data.main && Object.prototype.hasOwnProperty.call(data.main, "main_call_24vac")) ? data.main.main_call_24vac : null);
-        updateTabs(downstream);
-        updateCycleTabs(downstream);
-        applyPendingGraphSelection(downstream);
-        renderRows(downstream);
-        renderZoneOverview();
-        renderMainMapPreview();
-        refreshSiteMapZoneSelect();
-        refreshCommissioningZoneSelect();
-        if (activeRange === "live") renderSelectedGraph();
+        try { appendLivePoint(r, downstream, (data.main && Object.prototype.hasOwnProperty.call(data.main, "main_call_24vac")) ? data.main.main_call_24vac : null); } catch (_e) {}
+        try { updateTabs(downstream); } catch (_e) {}
+        try { updateCycleTabs(downstream); } catch (_e) {}
+        try { applyPendingGraphSelection(downstream); } catch (_e) {}
+        try { renderRows(downstream); } catch (_e) {}
+        try { renderZoneOverview(); } catch (_e) {}
+        try { renderMainMapPreview(); } catch (_e) {}
+        try { refreshSiteMapZoneSelect(); } catch (_e) {}
+        try { refreshCommissioningZoneSelect(); } catch (_e) {}
+        if (activeRange === "live") {
+          try { renderSelectedGraph(); } catch (_e) {}
+        }
 
         const trouble = Number(data.trouble_count || 0);
         const unack = Number(data.unack_alert_count || 0);
@@ -5678,6 +6288,7 @@ HTML = """<!doctype html>
         document.getElementById("updated").textContent = "Updated: " + (data.updated_utc || new Date().toISOString());
       } catch (e) {
         document.getElementById("updated").textContent = "Updated: connection lost";
+        setOutdoorTop(null);
       }
     }
 
@@ -5686,11 +6297,18 @@ HTML = """<!doctype html>
         { id: "zone1_main", label: "Zone 1 (Main)" },
         { id: "zone2_main", label: "Zone 2 (Main)" },
       ];
+      const seen = new Set(out.map((o) => o.id));
       const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
-      ds.forEach((z) => {
+      realDownstreamRows(ds).forEach((z) => {
         const zid = String((z && z.id) || "").trim();
-        if (!zid) return;
+        if (!zid || seen.has(zid)) return;
+        seen.add(zid);
         out.push({ id: zid, label: String(z.name || zid) });
+      });
+      plannedZonesFromSiteMapConfig().forEach((z) => {
+        if (!z.id || seen.has(z.id)) return;
+        seen.add(z.id);
+        out.push({ id: z.id, label: `${z.label} (Unassigned)` });
       });
       return out;
     }
@@ -5732,12 +6350,12 @@ HTML = """<!doctype html>
       const sel = document.getElementById("siteMapZoneSelect");
       if (!sel) return;
       const prev = sel.value;
-      const opts = siteMapZoneOptions().filter((o) => {
-        if (o.id === "zone1_main" || o.id === "zone2_main") return true;
-        const ds = (lastHubPayload && Array.isArray(lastHubPayload.downstream)) ? lastHubPayload.downstream : [];
-        const row = ds.find((z) => String(z.id || "") === String(o.id));
-        return row ? isAdoptedZone(row) : false;
-      });
+      let opts = siteMapZoneOptions();
+      if (siteMapSetupMode === "zone-main") {
+        opts = opts.filter((o) => isMainZoneId(o.id));
+      } else if (siteMapSetupMode === "zone-downstream") {
+        opts = opts.filter((o) => !isMainZoneId(o.id));
+      }
       sel.innerHTML = "";
       opts.forEach((o) => {
         const op = document.createElement("option");
@@ -5746,7 +6364,50 @@ HTML = """<!doctype html>
         sel.appendChild(op);
       });
       if (opts.some((o) => o.id === prev)) sel.value = prev;
+      else if (opts.length) sel.value = opts[0].id;
       syncSiteMapDetailsFormFromSelected();
+    }
+
+    function addPlannedZoneFromForm() {
+      const nameEl = document.getElementById("siteMapPlannedZoneName");
+      const parentEl = document.getElementById("siteMapPlannedParent");
+      const rawName = String(nameEl?.value || "").trim();
+      if (!rawName) {
+        setSiteMapMsg("Enter a planned zone name first.");
+        return;
+      }
+      if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+      if (!Array.isArray(siteMapConfig.planned_zones)) siteMapConfig.planned_zones = [];
+      const parent = normalizeParentZoneName(parentEl?.value || "Zone 1");
+      const baseId = slugifyClient(`${parent}-${rawName}`);
+      let zid = baseId;
+      let idx = 2;
+      const taken = new Set(siteMapZoneOptions().map((o) => String(o.id || "")));
+      while (taken.has(zid)) {
+        zid = `${baseId}-${idx}`;
+        idx += 1;
+      }
+      siteMapConfig.planned_zones.push({
+        id: zid,
+        label: rawName,
+        parent_zone: parent,
+        updated_utc: new Date().toISOString(),
+      });
+      if (nameEl) nameEl.value = "";
+      refreshSiteMapZoneSelect();
+      const sel = document.getElementById("siteMapZoneSelect");
+      if (sel) sel.value = zid;
+      syncSiteMapDetailsFormFromSelected();
+      updateSiteMapWorkspaceStatus(`Planned zone added: ${rawName}`);
+      setSiteMapMsg(`Planned zone added: ${rawName}. Opening map setup for this zone...`);
+      openZoneSetupWorkspace("zone-downstream");
+      setTimeout(() => {
+        const zoneSel = document.getElementById("siteMapZoneSelect");
+        if (zoneSel) zoneSel.value = zid;
+        syncSiteMapDetailsFormFromSelected();
+        useSelectedZoneSetupDevice();
+        setSiteMapMsg(`Now mapping: ${rawName}. Click inside the building outline to place pin, then add details and Save & Finish.`);
+      }, 130);
     }
 
     function applySiteMapStateToForm() {
@@ -5754,15 +6415,18 @@ HTML = """<!doctype html>
       const fullAddr = String(siteMapConfig.address || "");
       document.getElementById("siteAddress").value = fullAddr;
       const streetEl = document.getElementById("siteAddrStreet");
+      const cityEl = document.getElementById("siteAddrCity");
       const stateEl = document.getElementById("siteAddrState");
       const zipEl = document.getElementById("siteAddrZip");
-      if (streetEl || stateEl || zipEl) {
+      if (streetEl || cityEl || stateEl || zipEl) {
         const parts = fullAddr.split(",").map((s) => s.trim()).filter(Boolean);
         let street = fullAddr;
+        let city = "";
         let state = "";
         let zip = "";
         if (parts.length >= 2) {
           street = parts[0];
+          city = parts[1] || "";
         }
         const tail = parts.length >= 2 ? parts.slice(1).join(" ") : fullAddr;
         if (tail) {
@@ -5777,6 +6441,7 @@ HTML = """<!doctype html>
           }
         }
         if (streetEl) streetEl.value = street;
+        if (cityEl) cityEl.value = city;
         if (stateEl) stateEl.value = state;
         if (zipEl) zipEl.value = zip;
       }
@@ -5790,6 +6455,9 @@ HTML = """<!doctype html>
       }
       const floorsEl = document.getElementById("siteMapBuildingFloors");
       if (floorsEl) floorsEl.value = String(Math.max(1, Number(siteMapConfig.building_floors || 1)));
+      // Default to hidden once an address has been saved; user can unhide via button.
+      siteAddressEditorCollapsed = !!String(siteMapConfig.address || "").trim();
+      renderSiteAddressEditorState();
       syncSiteMapDetailsFormFromSelected();
       updateSiteMapZoneMappingAvailability();
     }
@@ -5799,10 +6467,12 @@ HTML = """<!doctype html>
       const wrap = document.getElementById("siteMapZoneMappingSection");
       const lockNote = document.getElementById("siteMapZoneMappingLockedNote");
       const zoneWrap = document.getElementById("siteMapZoneSelectWrap");
+      const plannedWrap = document.getElementById("siteMapPlannedZoneWrap");
       const zoneSetupBtn = document.getElementById("siteMapZoneSetupBtn");
       const zoneWizard = document.getElementById("siteMapZoneWizard");
       if (wrap) wrap.classList.toggle("hidden", !ready);
       if (zoneWrap) zoneWrap.classList.toggle("hidden", !ready);
+      if (plannedWrap) plannedWrap.classList.toggle("hidden", !ready);
       if (lockNote) lockNote.style.display = ready ? "none" : "block";
       if (zoneSetupBtn) {
         zoneSetupBtn.disabled = !ready;
@@ -5812,7 +6482,8 @@ HTML = """<!doctype html>
       if (zoneWizard) zoneWizard.classList.toggle("show", ready && (siteMapSetupMode === "zone-main" || siteMapSetupMode === "zone-downstream"));
 
       const zoneIds = [
-        "siteMapZoneSelect", "siteMapClearPinBtn", "siteMapStartAreaBtn", "siteMapFinishAreaBtn",
+        "siteMapZoneSelect", "siteMapPlannedZoneName", "siteMapPlannedParent", "siteMapAddPlannedZoneBtn",
+        "siteMapClearPinBtn", "siteMapStartAreaBtn", "siteMapFinishAreaBtn",
         "siteMapCancelAreaBtn", "siteMapClearAreaBtn", "siteMapAreaUndoBtn", "siteMapPinColor",
         "siteMapEquipType", "siteMapRoomArea", "siteMapThermostatLoc", "siteMapValveType",
         "siteMapPumpModel", "siteMapPumpVoltage", "siteMapDesc", "siteMapAccessInstructions",
@@ -6210,8 +6881,8 @@ HTML = """<!doctype html>
       if (siteMapSetupMode === "zone-main") {
         if (sel && !["zone1_main", "zone2_main"].includes(String(sel.value || ""))) sel.value = "";
       } else if (siteMapSetupMode === "zone-downstream") {
-        const ds = realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []);
-        if (sel && (!sel.value || isMainZoneId(String(sel.value || "")) || !ds.some((z) => String(z.id) === String(sel.value || "")))) sel.value = "";
+        const ids = new Set(siteMapZoneOptions().filter((o) => !isMainZoneId(o.id)).map((o) => String(o.id)));
+        if (sel && (!sel.value || isMainZoneId(String(sel.value || "")) || !ids.has(String(sel.value || "")))) sel.value = "";
       }
       syncSiteMapDetailsFormFromSelected();
       if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
@@ -6235,7 +6906,7 @@ HTML = """<!doctype html>
       if (siteMapSetupMode !== "zone-downstream") return;
       const zid = selectedSiteMapZoneId();
       if (!zid || isMainZoneId(zid)) {
-        setSiteMapMsg("Choose a downstream zone/device from the Zone / Device dropdown first.");
+        setSiteMapMsg("Choose a downstream zone from the Zone / Device dropdown first.");
         renderSiteMapZoneWizard();
         return;
       }
@@ -6243,8 +6914,8 @@ HTML = """<!doctype html>
       if (!centerMapOnZonePin(zid)) {
         if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
       }
-      updateSiteMapWorkspaceStatus(`Selected downstream device: ${(siteMapZoneOptions().find((o) => o.id === zid) || {}).label || zid}`);
-      setSiteMapMsg("Downstream device selected. Click inside the building outline to place the pin, then draw an optional area.");
+      updateSiteMapWorkspaceStatus(`Selected downstream zone: ${(siteMapZoneOptions().find((o) => o.id === zid) || {}).label || zid}`);
+      setSiteMapMsg("Downstream zone selected. Click inside the building outline to place the pin, then draw an optional area.");
       renderSiteMapZoneWizard();
     }
 
@@ -6394,7 +7065,10 @@ HTML = """<!doctype html>
           .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
         if (ll.length < 3) return;
         const row = ds.find((z) => String(z.id || "") === String(zid));
-        const parentColor = row ? parentZoneColorHex(row.parent_zone) : pinColorHex(p.color);
+        const planned = plannedZoneById(zid);
+        const parentColor = row
+          ? parentZoneColorHex(row.parent_zone)
+          : (planned ? parentZoneColorHex(planned.parent_zone) : pinColorHex(p.color));
         const fillColor = pinColorHex(p.color);
         const poly = L.polygon(ll, {
           color: parentColor,
@@ -6430,6 +7104,10 @@ HTML = """<!doctype html>
         try { siteMapMap.removeLayer(siteMapBuildingConfirmMarker); } catch (e) {}
         siteMapBuildingConfirmMarker = null;
       }
+      // Show confirm pin only while doing early building setup.
+      // Once an outline is saved, the confirm pin is visual noise.
+      const hasOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      if (hasOutline) return;
       const p = siteMapConfig && siteMapConfig.building_confirm_pin;
       if (!p || typeof p !== "object") return;
       const lat = Number(p.lat), lng = Number(p.lng);
@@ -6609,7 +7287,15 @@ HTML = """<!doctype html>
           openMainBoilerFloorPopup(zoneId);
           setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Set the floor in the map popup, then click Save & Finish.`);
         } else {
-          setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Click Save & Finish to store.`);
+          setSiteMapMsg(`Placed pin for ${labels[zoneId] || zoneId}. Opening details next step...`);
+          setTimeout(() => {
+            openSiteMapPinPlacedModal(zoneId);
+            const detailsAnchor = document.getElementById("siteMapPinColor") || document.getElementById("siteMapEquipType");
+            if (detailsAnchor && typeof detailsAnchor.scrollIntoView === "function") {
+              try { detailsAnchor.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (_e) {}
+            }
+            focusNoScroll(document.getElementById("siteMapEquipType"));
+          }, 60);
         }
       });
       siteMapMap.on("mousedown", (e) => {
@@ -6710,6 +7396,7 @@ HTML = """<!doctype html>
         const res = await fetch(`/api/site-map?_=${Date.now()}`, { cache: "no-store" });
         siteMapConfig = await res.json();
         if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+        if (!Array.isArray(siteMapConfig.planned_zones)) siteMapConfig.planned_zones = [];
         applySiteMapStateToForm();
         if (siteMapMap && siteMapConfig.center) {
           siteMapMap.setView([Number(siteMapConfig.center.lat), Number(siteMapConfig.center.lng)], Number(siteMapConfig.zoom || 16));
@@ -6724,6 +7411,7 @@ HTML = """<!doctype html>
 
     async function saveSiteMapConfig() {
       if (!siteMapConfig || typeof siteMapConfig !== "object") siteMapConfig = { pins: {} };
+      if (!Array.isArray(siteMapConfig.planned_zones)) siteMapConfig.planned_zones = [];
       siteMapConfig.address = document.getElementById("siteAddress").value.trim();
       siteMapConfig.map_layer = document.getElementById("siteMapLayer")?.value || "street";
       const invalidPinLabels = [];
@@ -6771,7 +7459,12 @@ HTML = """<!doctype html>
       });
       setOutlineWizardStep(1, "Finding address and centering the map...", { skipAssist: true });
       const q = buildSiteAddressQueryFromFields() || String(document.getElementById("siteAddress")?.value || "").trim();
-      if (!q) { setSiteMapMsg("Enter a building address first."); return; }
+      if (!q) {
+        forceBuildingAddressSearchVisible("Step 1: type the building address in the search bar, then click Find Address.");
+        setOutlineWizardStep(1, "Step 1: type the building address in the search bar, then click Find Address.", { skipAssist: true });
+        setSiteMapMsg("Enter a building address first.");
+        return;
+      }
       setSiteMapMsg("Finding address...");
       try {
         const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}&_=${Date.now()}`, { cache: "no-store" });
@@ -6789,9 +7482,9 @@ HTML = """<!doctype html>
         renderSiteMapMarkers();
         setOutlineWizardStep(2, "Address found. Step 2: click the building on the map to confirm the correct structure.", { skipAssist: true });
         setTimeout(() => {
-          if (!siteMapMap) return;
-          try { siteMapMap.invalidateSize(); } catch (_e) {}
-          scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
+          // Always jump UI to map for Step 2, even if leaflet init lags.
+          try { if (siteMapMap) siteMapMap.invalidateSize(); } catch (_e) {}
+          forceMapIntoViewAfterAddressLookup();
           const canvas = document.getElementById("siteMapCanvas");
           if (canvas) focusNoScroll(canvas);
         }, 60);
@@ -6838,6 +7531,7 @@ HTML = """<!doctype html>
       siteMapBuildingEditOnlyMode = false;
       setSiteMapSetupMode("building");
       const hasSavedOutline = !!(siteMapConfig && siteMapConfig.building_outline);
+      const hasAddress = !!String((siteMapConfig && siteMapConfig.address) || "").trim();
       enterSiteMapWorkspace({
         title: "Building Outline Setup",
         hint: "Follow the steps to define the building boundary, then Save & Finish.",
@@ -6845,12 +7539,27 @@ HTML = """<!doctype html>
         outlineWizard: true,
       });
       setOutlineWizardStep(1, "Step 1: Find the building address, then click the map to confirm the building. Press Enter to continue.");
+      if (!hasAddress) {
+        forceBuildingAddressSearchVisible("Step 1: type the building address in the search bar, then click Find Address.");
+      }
       setTimeout(() => {
         if (!siteMapMap) return;
         if (!centerMapOnBuildingOutline()) centerMapOnAddressOrDefault(18);
         try { siteMapMap.invalidateSize(); } catch (_e) {}
+        const addressField = document.getElementById("siteAddrStreet");
         const canvas = document.getElementById("siteMapCanvas");
-        if (canvas) {
+        if (!hasAddress && addressField) {
+          // Step 1 should land directly on Find Address input, not jump straight to the map.
+          try {
+            const card = document.getElementById("siteMapCard");
+            if (card && card.classList.contains("workspace")) {
+              card.scrollTo({ top: 0, behavior: "smooth" });
+            } else {
+              addressField.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+          } catch (_e) {}
+          focusNoScroll(addressField, { select: true });
+        } else if (canvas) {
           scrollSiteMapWorkspaceToCanvas({ behavior: "smooth", pad: 8 });
           focusNoScroll(canvas);
         }
@@ -8030,6 +8739,12 @@ HTML = """<!doctype html>
             return;
           }
         }
+        // Same-origin building switch: clear stale UI state and reload scoped data.
+        mainMapPreviewLastRenderKey = "";
+        siteMapConfig = null;
+        renderMainMapPreview();
+        await Promise.all([refreshHub(), loadSiteMapConfig()]);
+        refreshHubBranding();
         setBuildingsMsg("Building selected.");
       } catch (e) {
         setBuildingsMsg("Select failed: " + e.message);
@@ -8409,14 +9124,14 @@ HTML = """<!doctype html>
       if (openBuildingBtn) openBuildingBtn.addEventListener("click", openSelectedBuilding);
       if (manageBuildingsBtn) manageBuildingsBtn.addEventListener("click", toggleBuildingsPanel);
       if (buildingSwitcher) {
-        buildingSwitcher.addEventListener("change", () => {
+        buildingSwitcher.addEventListener("change", async () => {
           const bid = String(buildingSwitcher.value || "");
           if (!bid) return;
           if (bid === BUILDING_SWITCH_ADD_VALUE) {
             window.location.href = "/buildings/new";
             return;
           }
-          selectBuilding(bid, false);
+          await selectBuilding(bid, false);
         });
       }
     }
@@ -8492,7 +9207,7 @@ HTML = """<!doctype html>
             useSelectedZoneSetupDevice();
             return;
           }
-          setSiteMapMsg("Zone Setup ready. Select a downstream device and click inside the building outline to place a pin.");
+          setSiteMapMsg("Zone Setup ready. Select a downstream zone and click inside the building outline to place a pin.");
         }, 160);
       }, 100);
     }
@@ -8533,6 +9248,21 @@ HTML = """<!doctype html>
     if (previewEditZonesBtn) previewEditZonesBtn.addEventListener("click", openZoneMapEditorFromPreview);
     const previewEditBtn = document.getElementById("mainMapPreviewEditBtn");
     if (previewEditBtn) previewEditBtn.addEventListener("click", openBuildingMapEditorFromPreview);
+    document.getElementById("siteMapAddPlannedZoneBtn").addEventListener("click", addPlannedZoneFromForm);
+    document.getElementById("siteMapPlannedZoneName").addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      addPlannedZoneFromForm();
+    });
+    document.getElementById("siteAddressEditToggleBtn").addEventListener("click", () => {
+      setSiteAddressEditorCollapsed(!siteAddressEditorCollapsed, { force: true });
+      if (!siteAddressEditorCollapsed) {
+        setTimeout(() => {
+          const el = document.getElementById("siteAddrStreet");
+          if (el) focusNoScroll(el, { select: true });
+        }, 40);
+      }
+    });
     document.getElementById("siteMapFindBtn").addEventListener("click", geocodeSiteAddress);
     document.getElementById("siteMapFootprintBtn").addEventListener("click", openBuildingOutlineWizard);
     document.getElementById("siteMapZoneSetupBtn").addEventListener("click", () => openZoneSetupWorkspace("zone-main"));
@@ -8550,17 +9280,21 @@ HTML = """<!doctype html>
     document.getElementById("siteMapZoneWizardRefreshZoneBtn").addEventListener("click", () => {
       refreshSiteMapZoneSelect();
       const sel = document.getElementById("siteMapZoneSelect");
-      const ds = realDownstreamRows((lastHubPayload && lastHubPayload.downstream) || []);
-      if (sel && ds.length) sel.value = String(ds[0].id);
+      const downstreamOpts = siteMapZoneOptions().filter((o) => !isMainZoneId(o.id));
+      if (sel && downstreamOpts.length) sel.value = String(downstreamOpts[0].id);
       syncSiteMapDetailsFormFromSelected();
-      setSiteMapMsg(ds.length ? "Downstream zone list refreshed. Select a zone/device and click inside the building outline to place a pin." : "No adopted downstream zones available yet.");
+      setSiteMapMsg(
+        downstreamOpts.length
+          ? "Zone list refreshed. Select a downstream zone/device and click inside the building outline to place a pin."
+          : "No downstream zones available yet. Add a planned zone or adopt a device."
+      );
       renderSiteMapZoneWizard();
     });
     document.getElementById("siteMapZoneWizardStartAreaBtn").addEventListener("click", () => {
       const sel = document.getElementById("siteMapZoneSelect");
       const zid = String(sel?.value || "");
       if (!zid || isMainZoneId(zid)) {
-        setSiteMapMsg("Select a downstream zone/device first, then start zone area drawing.");
+        setSiteMapMsg("Select a downstream zone first, then start zone area drawing.");
         return;
       }
       startZoneAreaDraw();
@@ -8591,6 +9325,20 @@ HTML = """<!doctype html>
     document.getElementById("siteMapResetBuildingCloseBtn").addEventListener("click", closeResetBuildingModal);
     document.getElementById("siteMapResetBuildingCancelBtn").addEventListener("click", closeResetBuildingModal);
     document.getElementById("siteMapResetBuildingConfirmBtn").addEventListener("click", resetBuildingSetupAndMap);
+    document.getElementById("siteMapPinPlacedCloseBtn").addEventListener("click", closeSiteMapPinPlacedModal);
+    document.getElementById("siteMapPinPlacedSaveFinishBtn").addEventListener("click", async () => {
+      await completePinSetupSaveAndChooseNext(false);
+    });
+    document.getElementById("siteMapPinPlacedSkipBtn").addEventListener("click", async () => {
+      await completePinSetupSaveAndChooseNext(true);
+    });
+    document.getElementById("siteMapPostSaveReturnBtn").addEventListener("click", async () => {
+      await saveAndReturnToMainDashboard();
+    });
+    document.getElementById("siteMapPostSaveAnotherBtn").addEventListener("click", async () => {
+      await saveAndSetupAnotherZone();
+    });
+    document.getElementById("siteMapPostSaveDetailsBtn").addEventListener("click", continueEditingCurrentZoneDetails);
     document.getElementById("siteMapApplyParentColorsBtn").addEventListener("click", applyParentColorsToZones);
     document.getElementById("siteMapSelectZone1MainBtn").addEventListener("click", () => selectMainBoilerZone("zone1_main"));
     document.getElementById("siteMapSelectZone2MainBtn").addEventListener("click", () => selectMainBoilerZone("zone2_main"));
@@ -8641,6 +9389,18 @@ HTML = """<!doctype html>
           return;
         }
       }
+      const pinPlacedModalOpen = !!document.getElementById("siteMapPinPlacedModal")?.classList.contains("show");
+      if (pinPlacedModalOpen && e.key === "Escape") {
+        e.preventDefault();
+        closeSiteMapPinPlacedModal();
+        return;
+      }
+      const postSaveModalOpen = !!document.getElementById("siteMapPostSaveModal")?.classList.contains("show");
+      if (postSaveModalOpen && e.key === "Escape") {
+        e.preventDefault();
+        closeSiteMapPostSaveModal();
+        return;
+      }
       if (e.key === "Escape" && siteMapWorkspaceOpen) {
         if (siteMapOutlineDragMode) {
           e.preventDefault();
@@ -8678,6 +9438,12 @@ HTML = """<!doctype html>
     document.getElementById("zoneInfoCloseBtn").addEventListener("click", closeZoneInfoModal);
     document.getElementById("zoneInfoModal").addEventListener("click", (e) => {
       if (e.target && e.target.id === "zoneInfoModal") closeZoneInfoModal();
+    });
+    document.getElementById("siteMapPinPlacedModal").addEventListener("click", (e) => {
+      if (e.target && e.target.id === "siteMapPinPlacedModal") closeSiteMapPinPlacedModal();
+    });
+    document.getElementById("siteMapPostSaveModal").addEventListener("click", (e) => {
+      if (e.target && e.target.id === "siteMapPostSaveModal") closeSiteMapPostSaveModal();
     });
     document.getElementById("saveNotifBtn").addEventListener("click", saveNotifications);
     document.getElementById("testNotifBtn").addEventListener("click", testNotifications);
@@ -8786,6 +9552,18 @@ BUILDING_NEW_HTML = """<!doctype html>
       color:var(--text);cursor:pointer;font-weight:700
     }
     .btn.primary{background:var(--btn);color:var(--btnText);border-color:var(--btn)}
+    .addr-suggest{
+      position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:60;
+      display:none; max-height:220px; overflow:auto; background:#fff;
+      border:1px solid var(--border); border-radius:10px; box-shadow:0 10px 24px rgba(10,31,44,.14);
+    }
+    .addr-suggest.show{display:block}
+    .addr-suggest .item{
+      display:block; width:100%; border:0; border-bottom:1px solid #edf2f7; background:#fff;
+      text-align:left; padding:10px 12px; cursor:pointer; color:#102030; font-size:.9rem;
+    }
+    .addr-suggest .item:last-child{border-bottom:0}
+    .addr-suggest .item:hover,.addr-suggest .item.active{background:#edf7fc}
     #msg{margin-top:8px;font-size:.9rem;color:#0b6ea8;min-height:20px}
   </style>
 </head>
@@ -8821,33 +9599,65 @@ BUILDING_NEW_HTML = """<!doctype html>
       if (el) el.textContent = m || "";
     };
     const toOrigin = (u) => String(u || "").replace(/\/+$/, "");
-    const addressSuggestState = { items: [], timer: null, controller: null };
+    const addressSuggestState = { items: [], timer: null, controller: null, activeIndex: -1 };
     const defaultHubUrl = toOrigin(window.location.origin);
-    function ensureAddressDatalist() {
+    function ensureAddressSuggestBox() {
       const input = document.getElementById("address");
       if (!input) return null;
-      const listId = "address_suggestions";
-      let dl = document.getElementById(listId);
-      if (!dl) {
-        dl = document.createElement("datalist");
-        dl.id = listId;
-        document.body.appendChild(dl);
+      const host = input.parentElement;
+      if (host) {
+        const pos = (window.getComputedStyle(host).position || "").toLowerCase();
+        if (!pos || pos === "static") host.style.position = "relative";
       }
-      input.setAttribute("list", listId);
-      return dl;
+      const boxId = "address_suggestions";
+      let box = document.getElementById(boxId);
+      if (!box) {
+        box = document.createElement("div");
+        box.id = boxId;
+        box.className = "addr-suggest";
+        box.setAttribute("role", "listbox");
+        (host || document.body).appendChild(box);
+      }
+      return box;
     }
     function initAddressAutocomplete() {
       const input = document.getElementById("address");
-      const dl = ensureAddressDatalist();
-      if (!input || !dl) return;
+      const box = ensureAddressSuggestBox();
+      if (!input || !box) return;
       const render = (items) => {
-        dl.innerHTML = "";
-        (items || []).slice(0, 5).forEach((r) => {
+        box.innerHTML = "";
+        const rows = (items || []).slice(0, 5);
+        if (!rows.length) {
+          box.classList.remove("show");
+          addressSuggestState.activeIndex = -1;
+          return;
+        }
+        rows.forEach((r, i) => {
           if (!r || !r.display_name) return;
-          const op = document.createElement("option");
-          op.value = String(r.display_name);
-          dl.appendChild(op);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "item";
+          btn.textContent = String(r.display_name);
+          btn.addEventListener("mousedown", (e) => e.preventDefault());
+          btn.addEventListener("click", () => {
+            input.value = String(r.display_name);
+            box.classList.remove("show");
+            addressSuggestState.activeIndex = -1;
+          });
+          box.appendChild(btn);
         });
+        box.classList.add("show");
+        addressSuggestState.activeIndex = 0;
+        const first = box.querySelector(".item");
+        if (first) first.classList.add("active");
+      };
+      const setActive = (idx) => {
+        const btns = Array.from(box.querySelectorAll(".item"));
+        if (!btns.length) { addressSuggestState.activeIndex = -1; return; }
+        if (idx < 0) idx = btns.length - 1;
+        if (idx >= btns.length) idx = 0;
+        addressSuggestState.activeIndex = idx;
+        btns.forEach((b, i) => b.classList.toggle("active", i === idx));
       };
       const search = async () => {
         const q = String(input.value || "").trim();
@@ -8877,6 +9687,29 @@ BUILDING_NEW_HTML = """<!doctype html>
       input.addEventListener("input", () => {
         if (addressSuggestState.timer) clearTimeout(addressSuggestState.timer);
         addressSuggestState.timer = setTimeout(search, 220);
+      });
+      input.addEventListener("keydown", (e) => {
+        const open = box.classList.contains("show");
+        if (e.key === "ArrowDown" && open) { e.preventDefault(); setActive((addressSuggestState.activeIndex ?? -1) + 1); }
+        if (e.key === "ArrowUp" && open) { e.preventDefault(); setActive((addressSuggestState.activeIndex ?? 0) - 1); }
+        if (e.key === "Enter" && open) {
+          const pick = (addressSuggestState.items || [])[addressSuggestState.activeIndex >= 0 ? addressSuggestState.activeIndex : 0];
+          if (pick && pick.display_name) {
+            e.preventDefault();
+            input.value = String(pick.display_name);
+            box.classList.remove("show");
+            addressSuggestState.activeIndex = -1;
+          }
+        }
+        if (e.key === "Escape") {
+          box.classList.remove("show");
+          addressSuggestState.activeIndex = -1;
+        }
+      });
+      input.addEventListener("blur", () => setTimeout(() => { box.classList.remove("show"); }, 120));
+      document.addEventListener("click", (e) => {
+        if (e.target === input || box.contains(e.target)) return;
+        box.classList.remove("show");
       });
     }
     initAddressAutocomplete();
@@ -9198,6 +10031,7 @@ class H(BaseHTTPRequestHandler):
                     "q": q,
                     "format": "jsonv2",
                     "limit": 5,
+                    "addressdetails": 1,
                 })
                 req = Request(url, headers={"User-Agent": "165-water-street-heating-hub/1.0"})
                 with urlopen(req, timeout=8) as resp:
@@ -9208,10 +10042,20 @@ class H(BaseHTTPRequestHandler):
                     for r in parsed_results[:5]:
                         if not isinstance(r, dict):
                             continue
+                        addr = r.get("address") if isinstance(r.get("address"), dict) else {}
                         results.append({
                             "display_name": str(r.get("display_name") or ""),
                             "lat": r.get("lat"),
                             "lng": r.get("lon"),
+                            "address": {
+                                "house_number": str(addr.get("house_number") or ""),
+                                "road": str(addr.get("road") or addr.get("pedestrian") or addr.get("footway") or ""),
+                                "city": str(addr.get("city") or addr.get("town") or addr.get("village") or addr.get("hamlet") or addr.get("municipality") or addr.get("suburb") or ""),
+                                "state": str(addr.get("state") or ""),
+                                "state_code": str(addr.get("state_code") or ""),
+                                "postcode": str(addr.get("postcode") or ""),
+                                "country": str(addr.get("country") or ""),
+                            },
                         })
                 b = json.dumps({"query": q, "results": results}).encode("utf-8")
                 self.send_response(200)
@@ -9360,107 +10204,110 @@ class H(BaseHTTPRequestHandler):
             return
 
         if route == "/api/buildings/save":
-            cfg = load_buildings_config()
-            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
-            requested_id = str(body.get("id") or "").strip().lower()
-            bid = requested_id
-            name = str(body.get("name") or "").strip()
-            address = str(body.get("address") or "").strip()
-            hub_url = normalize_hub_url(body.get("hub_url") or "")
-            notes = str(body.get("notes") or "").strip()
-            if not name:
-                b = json.dumps({"error": "name is required"}).encode("utf-8")
-                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            if not hub_url:
-                b = json.dumps({"error": "hub_url is required"}).encode("utf-8")
-                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            updated = False
-            if bid:
-                # Explicit id means edit existing entry.
-                for i, bld in enumerate(rows):
-                    if not isinstance(bld, dict):
-                        continue
-                    if str(bld.get("id") or "").strip().lower() == bid:
-                        rows[i] = {"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes}
-                        updated = True
-                        break
-                if not updated:
-                    b = json.dumps({"error": "building id not found for update"}).encode("utf-8")
-                    self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            else:
-                # No id means create a new building; always ensure unique id.
-                base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or f"building-{uuid.uuid4().hex[:8]}"
-                if base == "local":
-                    base = "building"
-                existing = {
-                    str(r.get("id") or "").strip().lower()
-                    for r in rows if isinstance(r, dict)
-                }
-                bid = base
-                n = 2
-                while bid in existing:
-                    bid = f"{base}-{n}"
-                    n += 1
-                rows.append({"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes})
-                try:
-                    init_building_state(bid, reset=True)
-                except Exception:
-                    pass
-            cfg["buildings"] = rows
-            if not cfg.get("active_building_id"):
-                cfg["active_building_id"] = "local"
-            if not save_buildings_config(cfg):
-                b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
-                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            out = public_buildings_config()
-            out["saved_id"] = bid
-            out["saved_name"] = name
-            out["created"] = (not updated)
-            b = json.dumps(out).encode("utf-8")
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            with buildings_config_lock:
+                cfg = load_buildings_config()
+                rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+                requested_id = str(body.get("id") or "").strip().lower()
+                bid = requested_id
+                name = str(body.get("name") or "").strip()
+                address = str(body.get("address") or "").strip()
+                hub_url = normalize_hub_url(body.get("hub_url") or "")
+                notes = str(body.get("notes") or "").strip()
+                if not name:
+                    b = json.dumps({"error": "name is required"}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                if not hub_url:
+                    b = json.dumps({"error": "hub_url is required"}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                updated = False
+                if bid:
+                    # Explicit id means edit existing entry.
+                    for i, bld in enumerate(rows):
+                        if not isinstance(bld, dict):
+                            continue
+                        if str(bld.get("id") or "").strip().lower() == bid:
+                            rows[i] = {"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes}
+                            updated = True
+                            break
+                    if not updated:
+                        b = json.dumps({"error": "building id not found for update"}).encode("utf-8")
+                        self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                else:
+                    # No id means create a new building; always ensure unique id.
+                    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or f"building-{uuid.uuid4().hex[:8]}"
+                    if base == "local":
+                        base = "building"
+                    existing = {
+                        str(r.get("id") or "").strip().lower()
+                        for r in rows if isinstance(r, dict)
+                    }
+                    bid = base
+                    n = 2
+                    while bid in existing:
+                        bid = f"{base}-{n}"
+                        n += 1
+                    rows.append({"id": bid, "name": name, "address": address, "hub_url": hub_url, "notes": notes})
+                    try:
+                        init_building_state(bid, reset=True)
+                    except Exception:
+                        pass
+                cfg["buildings"] = rows
+                if not cfg.get("active_building_id"):
+                    cfg["active_building_id"] = "local"
+                if not save_buildings_config(cfg):
+                    b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
+                    self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                out = public_buildings_config()
+                out["saved_id"] = bid
+                out["saved_name"] = name
+                out["created"] = (not updated)
+                b = json.dumps(out).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
         if route == "/api/buildings/select":
-            bid = str(body.get("id") or "").strip().lower()
-            if not bid:
-                b = json.dumps({"error": "id is required"}).encode("utf-8")
-                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            cfg = load_buildings_config()
-            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
-            if not any(isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid for r in rows):
-                b = json.dumps({"error": "building not found"}).encode("utf-8")
-                self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            cfg["active_building_id"] = bid
-            if not save_buildings_config(cfg):
-                b = json.dumps({"error": "failed to save active building"}).encode("utf-8")
-                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            reset_runtime_state_for_building_switch()
-            refresh_downstream_cache()
-            b = json.dumps(public_buildings_config()).encode("utf-8")
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            with buildings_config_lock:
+                bid = str(body.get("id") or "").strip().lower()
+                if not bid:
+                    b = json.dumps({"error": "id is required"}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                cfg = load_buildings_config()
+                rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+                if not any(isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid for r in rows):
+                    b = json.dumps({"error": "building not found"}).encode("utf-8")
+                    self.send_response(404); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                cfg["active_building_id"] = bid
+                if not save_buildings_config(cfg):
+                    b = json.dumps({"error": "failed to save active building"}).encode("utf-8")
+                    self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                reset_runtime_state_for_building_switch()
+                refresh_downstream_cache()
+                b = json.dumps(public_buildings_config()).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
         if route == "/api/buildings/delete":
-            bid = str(body.get("id") or "").strip().lower()
-            if not bid:
-                b = json.dumps({"error": "id is required"}).encode("utf-8")
-                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            if bid == "local":
-                b = json.dumps({"error": "local building cannot be deleted"}).encode("utf-8")
-                self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            cfg = load_buildings_config()
-            rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
-            rows = [r for r in rows if not (isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid)]
-            cfg["buildings"] = rows
-            if str(cfg.get("active_building_id") or "").strip().lower() == bid:
-                cfg["active_building_id"] = "local"
-            if not save_buildings_config(cfg):
-                b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
-                self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
-            reset_runtime_state_for_building_switch()
-            refresh_downstream_cache()
-            b = json.dumps(public_buildings_config()).encode("utf-8")
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            with buildings_config_lock:
+                bid = str(body.get("id") or "").strip().lower()
+                if not bid:
+                    b = json.dumps({"error": "id is required"}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                if bid == "local":
+                    b = json.dumps({"error": "local building cannot be deleted"}).encode("utf-8")
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                cfg = load_buildings_config()
+                rows = cfg.get("buildings", []) if isinstance(cfg.get("buildings"), list) else []
+                rows = [r for r in rows if not (isinstance(r, dict) and str(r.get("id") or "").strip().lower() == bid)]
+                cfg["buildings"] = rows
+                if str(cfg.get("active_building_id") or "").strip().lower() == bid:
+                    cfg["active_building_id"] = "local"
+                if not save_buildings_config(cfg):
+                    b = json.dumps({"error": "failed to save buildings"}).encode("utf-8")
+                    self.send_response(500); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                reset_runtime_state_for_building_switch()
+                refresh_downstream_cache()
+                b = json.dumps(public_buildings_config()).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
             return
 
         if route == "/api/users/save":
@@ -9780,6 +10627,27 @@ class H(BaseHTTPRequestHandler):
                     cfg["building_outline"] = None
                 elif isinstance(bo, dict) and bo.get("type") in ("Polygon", "MultiPolygon"):
                     cfg["building_outline"] = bo
+                planned_in = body.get("planned_zones")
+                if isinstance(planned_in, list):
+                    planned_out = []
+                    for item in planned_in:
+                        if len(planned_out) >= 200:
+                            break
+                        if not isinstance(item, dict):
+                            continue
+                        zid = str(item.get("id") or "").strip()
+                        if not zid:
+                            continue
+                        parent_zone = str(item.get("parent_zone") or "Zone 1").strip()
+                        if parent_zone not in ("Zone 1", "Zone 2"):
+                            parent_zone = "Zone 1"
+                        planned_out.append({
+                            "id": zid,
+                            "label": str(item.get("label") or zid).strip()[:120] or zid,
+                            "parent_zone": parent_zone,
+                            "updated_utc": str(item.get("updated_utc") or now_utc_iso()),
+                        })
+                    cfg["planned_zones"] = planned_out
                 c = body.get("center", {})
                 if isinstance(c, dict):
                     try:
